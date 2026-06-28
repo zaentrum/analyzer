@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: analyzer
+  namespace: stube
+  labels:
+    app: analyzer
+spec:
+  selector:
+    matchLabels:
+      app: analyzer
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
