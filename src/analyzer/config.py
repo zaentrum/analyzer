@@ -14,18 +14,23 @@ class Config:
     oidc_token_url: str
     oidc_client_id: str
     oidc_client_secret: str
-    # Per-worker tunables. The HTTP claim endpoint clamps to [1, 32] anyway.
-    claim_batch_size: int = 2
-    idle_sleep_seconds: float = 15.0
+    # --- Kafka event-consumer settings -------------------------------
+    # The analyzer is a PURE Kafka consumer/producer: it CONSUMEs the
+    # enriched-item topic, runs the per-file pipeline, then PRODUCEs the
+    # analyzed-item topic. Broker list is comma-separated (e.g.
+    # "kafka:9092"). The bundled demo broker is PLAINTEXT — no TLS, no
+    # certs — so security.protocol defaults to PLAINTEXT and is only an
+    # env override for deployments that front the broker with SASL/TLS.
+    kafka_brokers: str = "kafka:9092"
+    kafka_group_id: str = "analyzer-workers"
+    consume_topic: str = "stube.catalog.item.enriched"
+    produce_topic: str = "stube.catalog.item.analyzed"
+    kafka_security_protocol: str = "PLAINTEXT"
+    # The step name carried on the PRODUCEd next-stage event. The
+    # transcoder keys its work off this; keep it aligned with the
+    # transcoder's expectation.
+    produce_step: str = "transcode"
     error_sleep_seconds: float = 30.0
-    # tidb_first sweep: TIDB-only worker that runs alongside the per_file
-    # loop and short-circuits the ML pipelines when TIDB already has
-    # data. Defaults are sized to stay comfortably under TIDB's anonymous
-    # rate limit (30 req / 10 s).
-    tidb_first_enabled: bool = True
-    tidb_first_batch_size: int = 4
-    tidb_first_idle_sleep_seconds: float = 30.0
-    tidb_first_claim_interval_seconds: float = 0.5
     # Whisper config (used by the GPU pipeline; the CPU-only pipelines ignore
     # these). large-v3 is overkill for credit-text detection; medium gives
     # 95%+ accuracy at half the VRAM.
@@ -44,15 +49,13 @@ class Config:
             oidc_token_url=_require("OIDC_TOKEN_URL"),
             oidc_client_id=_require("OIDC_CLIENT_ID"),
             oidc_client_secret=_require("OIDC_CLIENT_SECRET"),
-            claim_batch_size=int(os.environ.get("CLAIM_BATCH_SIZE", "2")),
-            idle_sleep_seconds=float(os.environ.get("IDLE_SLEEP_SECONDS", "15")),
+            kafka_brokers=os.environ.get("KAFKA_BROKERS", "kafka:9092"),
+            kafka_group_id=os.environ.get("KAFKA_GROUP_ID", "analyzer-workers"),
+            consume_topic=os.environ.get("CONSUME_TOPIC", "stube.catalog.item.enriched"),
+            produce_topic=os.environ.get("PRODUCE_TOPIC", "stube.catalog.item.analyzed"),
+            kafka_security_protocol=os.environ.get("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
+            produce_step=os.environ.get("PRODUCE_STEP", "transcode"),
             error_sleep_seconds=float(os.environ.get("ERROR_SLEEP_SECONDS", "30")),
-            tidb_first_enabled=os.environ.get("TIDB_FIRST_ENABLED", "true").lower() == "true",
-            tidb_first_batch_size=int(os.environ.get("TIDB_FIRST_BATCH_SIZE", "4")),
-            tidb_first_idle_sleep_seconds=float(
-                os.environ.get("TIDB_FIRST_IDLE_SLEEP_SECONDS", "30")),
-            tidb_first_claim_interval_seconds=float(
-                os.environ.get("TIDB_FIRST_CLAIM_INTERVAL_SECONDS", "0.5")),
             whisper_model=os.environ.get("WHISPER_MODEL", "medium"),
             whisper_device=os.environ.get("WHISPER_DEVICE", "cuda"),
             whisper_compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "float16"),

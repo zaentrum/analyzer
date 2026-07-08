@@ -10,7 +10,9 @@ metadata:
     plane: worker
 spec:
   # Start small. Once the per-file pipelines are validated and Whisper is on,
-  # bump to 2-3 replicas — Postgres SKIP LOCKED makes the claim path safe.
+  # bump to 2-3 replicas — the Kafka consumer group (analyzer-workers) hands
+  # each partition to exactly one worker, so replicas scale without dup work
+  # (partition the topic to >1 to actually parallelise).
   replicas: 1
   strategy:
     type: Recreate   # nvidia.com/gpu device plugin counts allocations strictly
@@ -64,18 +66,21 @@ spec:
                 secretKeyRef:
                   name: katalog-oidc
                   key: client-secret
-            - name: CLAIM_BATCH_SIZE
-              value: "2"
-            - name: IDLE_SLEEP_SECONDS
-              value: "20"
-            # tidb_first sweep tuning. At 0.25 s between items and a
-            # batch of 4 the worker averages ~1.5 calls/s — comfortably
-            # under TIDB's 30 req / 10 s anonymous ceiling once
-            # per-batch claim overhead (~1 s) is amortised in.
-            - name: TIDB_FIRST_CLAIM_INTERVAL_SECONDS
-              value: "0.25"
-            - name: TIDB_FIRST_BATCH_SIZE
-              value: "4"
+            # Kafka event bus. The analyzer is a pure consumer: it reads
+            # the enriched-item topic, runs the pipeline, and produces the
+            # analyzed-item topic for the transcoder. The bundled demo
+            # broker is PLAINTEXT (no TLS) — override KAFKA_SECURITY_PROTOCOL
+            # for a SASL/TLS-fronted broker.
+            - name: KAFKA_BROKERS
+              value: "kafka.stube.svc.cluster.local:9092"
+            - name: KAFKA_GROUP_ID
+              value: "analyzer-workers"
+            - name: CONSUME_TOPIC
+              value: "stube.catalog.item.enriched"
+            - name: PRODUCE_TOPIC
+              value: "stube.catalog.item.analyzed"
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: "PLAINTEXT"
             - name: ENABLE_WHISPER
               value: "false"   # Phase 2c flips this on.
           volumeMounts:

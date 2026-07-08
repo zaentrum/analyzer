@@ -1,5 +1,11 @@
-"""HTTP client for the katalog Spring app: claim work, upload segments,
-fail items. JWT token is cached and re-fetched on 401."""
+"""HTTP client for the katalog Spring app: fetch item detail, upload
+segments/chapters, bookkeep steps, fail items. JWT token is cached and
+re-fetched on 401.
+
+Work is no longer claimed over HTTP — the analyzer is a pure Kafka
+consumer (see worker.run_event_consumer). This client only performs the
+per-item reads + writes the pipeline needs once an event has told it
+which item to process."""
 
 from __future__ import annotations
 
@@ -25,8 +31,8 @@ class ClaimedItem:
     year: int | None
     duration_ms: int | None
     path: str
-    # Season + episode coords + TMDB IDs flow through from the claim
-    # payload so the TIDB pipeline can ask
+    # Season + episode coords + TMDB IDs flow through from the item
+    # detail so the TIDB pipeline can ask
     # `GET /v2/media?tmdb_id=…&season=…&episode=…`. Movies carry their
     # own TMDB ID; episodes inherit it from the parent series. Either
     # may be None — TIDB pipeline skips the call when there's nothing
@@ -35,6 +41,7 @@ class ClaimedItem:
     episode_number: int | None = None
     series_tmdb_id: str | None = None
     movie_tmdb_id: str | None = None
+    series_title: str | None = None
 
     @property
     def tmdb_id(self) -> str | None:
@@ -101,29 +108,26 @@ class KatalogClient:
             return resp
         return resp  # type: ignore[return-value]
 
-    # ------------------------------------------------------------- claims
-    def claim(self, pass_kind: str = "per_file", limit: int = 2) -> list[ClaimedItem]:
-        resp = self._request(
-            "POST",
-            f"/api/analyze/claim?pass={pass_kind}&limit={limit}",
+    # -------------------------------------------------------- item detail
+    @staticmethod
+    def _item_from_json(it: dict[str, Any]) -> ClaimedItem:
+        """Parse a katalog item-detail JSON object into ClaimedItem.
+        Shared by get_item + siblings; tolerates missing optional keys
+        so a partial payload never crashes the parse (only `id`, `type`,
+        and `path` are load-bearing for the pipeline)."""
+        return ClaimedItem(
+            id=it["id"],
+            type=it["type"],
+            title=it.get("title") or "",
+            year=it.get("year"),
+            duration_ms=it.get("durationMs"),
+            path=it["path"],
+            season_number=it.get("seasonNumber"),
+            episode_number=it.get("episodeNumber"),
+            series_tmdb_id=it.get("seriesTmdbId"),
+            movie_tmdb_id=it.get("movieTmdbId"),
+            series_title=it.get("seriesTitle"),
         )
-        resp.raise_for_status()
-        items = resp.json().get("items", [])
-        return [
-            ClaimedItem(
-                id=it["id"],
-                type=it["type"],
-                title=it.get("title") or "",
-                year=it.get("year"),
-                duration_ms=it.get("durationMs"),
-                path=it["path"],
-                season_number=it.get("seasonNumber"),
-                episode_number=it.get("episodeNumber"),
-                series_tmdb_id=it.get("seriesTmdbId"),
-                movie_tmdb_id=it.get("movieTmdbId"),
-            )
-            for it in items
-        ]
 
     # ---------------------------------------------------------- uploads
     def upload_segments(self, item_id: str, segments: list[dict[str, Any]]) -> None:
@@ -216,24 +220,19 @@ class KatalogClient:
             resp.raise_for_status()
 
     def get_item(self, item_id: str) -> ClaimedItem | None:
-        """Fetch one item with its primary playback path. Returns None
-        when the item is unknown or has no primary asset. Used by the
-        packager flow to resolve the source file from an admin-issued
-        item id (the admin endpoint never trusts a client-supplied
-        path)."""
+        """Fetch one item's FULL analyze detail with its primary playback
+        path. Returns None when the item is unknown or has no primary
+        asset. The endpoint returns
+        {id,type,title,year,durationMs,path,seasonNumber,episodeNumber,
+        seriesTitle,seriesTmdbId,movieTmdbId} — all of which we parse so
+        the TIDB / chromaprint pipelines have the season/episode coords +
+        TMDB ids they need. Used by both the Kafka event consumer (to
+        resolve the item behind an `itemId`) and the packager flow."""
         resp = self._request("GET", f"/api/analyze/items/{item_id}")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
-        it = resp.json()
-        return ClaimedItem(
-            id=it["id"],
-            type=it["type"],
-            title=it.get("title") or "",
-            year=it.get("year"),
-            duration_ms=it.get("durationMs"),
-            path=it["path"],
-        )
+        return self._item_from_json(resp.json())
 
     def siblings(self, item_id: str, limit: int = 5) -> list[ClaimedItem]:
         """Return up to N sibling episodes of the same series + season,
@@ -249,21 +248,7 @@ class KatalogClient:
             return []
         resp.raise_for_status()
         items = resp.json().get("items", [])
-        return [
-            ClaimedItem(
-                id=it["id"],
-                type=it["type"],
-                title=it.get("title") or "",
-                year=it.get("year"),
-                duration_ms=it.get("durationMs"),
-                path=it["path"],
-                season_number=it.get("seasonNumber"),
-                episode_number=it.get("episodeNumber"),
-                series_tmdb_id=it.get("seriesTmdbId"),
-                movie_tmdb_id=it.get("movieTmdbId"),
-            )
-            for it in items
-        ]
+        return [self._item_from_json(it) for it in items]
 
     def upsert_step(
         self,

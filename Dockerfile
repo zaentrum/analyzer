@@ -49,7 +49,8 @@ RUN pip install --upgrade pip setuptools wheel
 # directory must exist before `pip install -e .` runs.
 WORKDIR /app
 RUN pip install httpx==0.28.1 structlog==25.4.0 fastapi==0.118.0 \
-                "uvicorn[standard]==0.32.0" faster-whisper==1.1.0
+                "uvicorn[standard]==0.32.0" faster-whisper==1.1.0 \
+                confluent-kafka==2.5.3
 
 COPY pyproject.toml ./
 COPY src ./src

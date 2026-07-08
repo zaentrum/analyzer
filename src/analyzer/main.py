@@ -1,7 +1,9 @@
 """Entry point. One process runs:
-  - the worker loop (thread)
+  - the Kafka event-consumer loop (thread)
+  - a per-item packaging consumer (thread, fed by the FastAPI endpoint)
   - a tiny FastAPI server for /healthz and /readyz, so k8s probes work.
-The worker is the actual job; the HTTP server is just kubelet plumbing."""
+The event consumer is the actual job; the HTTP server is just kubelet
+plumbing plus the on-demand packaging trigger."""
 
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from fastapi import FastAPI, HTTPException
 from .config import Config
 from .katalog import KatalogClient
 from .packager import package_item, package_status
-from .worker import run_tidb_first_worker, run_worker
+from .worker import run_event_consumer
 
 
 def _configure_logging() -> None:
@@ -37,7 +39,15 @@ def main() -> int:
     _configure_logging()
     log = structlog.get_logger("analyzer.main")
     cfg = Config.from_env()
-    log.info("analyzer.start", katalog=cfg.katalog_api_url, whisper=cfg.enable_whisper)
+    log.info(
+        "analyzer.start",
+        katalog=cfg.katalog_api_url,
+        whisper=cfg.enable_whisper,
+        brokers=cfg.kafka_brokers,
+        group_id=cfg.kafka_group_id,
+        consume_topic=cfg.consume_topic,
+        produce_topic=cfg.produce_topic,
+    )
 
     client = KatalogClient(
         base_url=cfg.katalog_api_url,
@@ -55,43 +65,27 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
 
+    # Single event-consumer thread. It CONSUMEs the enriched-item topic,
+    # runs the per-file pipeline, and PRODUCEs the analyzed-item topic.
+    # Replaces the old per_file + tidb_first claim-poll threads — tidb
+    # runs first inside analyze_one, so one event-driven pass covers it.
     worker_thread = threading.Thread(
-        target=run_worker,
+        target=run_event_consumer,
         kwargs={
             "client": client,
-            "batch_size": cfg.claim_batch_size,
-            "idle_sleep": cfg.idle_sleep_seconds,
+            "brokers": cfg.kafka_brokers,
+            "group_id": cfg.kafka_group_id,
+            "consume_topic": cfg.consume_topic,
+            "produce_topic": cfg.produce_topic,
+            "security_protocol": cfg.kafka_security_protocol,
+            "produce_step": cfg.produce_step,
             "error_sleep": cfg.error_sleep_seconds,
             "stop": stop,
         },
         daemon=True,
-        name="analyzer-worker",
+        name="analyzer-consumer",
     )
     worker_thread.start()
-
-    # Stage-1 TIDB-only sweep runs in a sibling thread so it doesn't
-    # block (or get blocked by) the slow per_file ML loop. Sharing the
-    # KatalogClient is safe — httpx.Client is documented as thread-safe
-    # for concurrent requests.
-    tidb_first_thread: threading.Thread | None = None
-    if cfg.tidb_first_enabled:
-        tidb_first_thread = threading.Thread(
-            target=run_tidb_first_worker,
-            kwargs={
-                "client": client,
-                "batch_size": cfg.tidb_first_batch_size,
-                "idle_sleep": cfg.tidb_first_idle_sleep_seconds,
-                "error_sleep": cfg.error_sleep_seconds,
-                "claim_interval": cfg.tidb_first_claim_interval_seconds,
-                "stop": stop,
-            },
-            daemon=True,
-            name="analyzer-tidb-first",
-        )
-        tidb_first_thread.start()
-        log.info("analyzer.tidb_first.started",
-                 batch_size=cfg.tidb_first_batch_size,
-                 claim_interval=cfg.tidb_first_claim_interval_seconds)
 
     # Per-item packaging queue. A single consumer thread runs one
     # shaka-packager invocation at a time — packaging is CPU-bound and
@@ -136,7 +130,8 @@ def main() -> int:
 
     @app.get("/readyz")
     def readyz() -> dict:
-        # Per_file thread must be alive; tidb_first is optional.
+        # The event-consumer thread must be alive; if it died (fatal
+        # Kafka error) k8s should stop routing to this pod and restart it.
         return {"ok": worker_thread.is_alive()}
 
     @app.post("/api/package/{item_id}")
@@ -171,9 +166,7 @@ def main() -> int:
     uvicorn.run(app, host="0.0.0.0", port=8080, log_config=None)
     stop.set()
     client.close()
-    worker_thread.join(timeout=10)
-    if tidb_first_thread is not None:
-        tidb_first_thread.join(timeout=10)
+    worker_thread.join(timeout=15)
     pkg_thread.join(timeout=10)
     return 0
 

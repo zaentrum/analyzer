@@ -4,9 +4,14 @@ version = "0.1.0"
 description = "intro-skipper-style media segment detector for katalog (chapters, silence, blackframe, whisper, chromaprint)."
 requires-python = ">=3.11"
 dependencies = [
-  # HTTP client to katalog API (claim, upload segments, fail). Sync because
-  # the worker loop is one-item-at-a-time per worker and there's no fan-out.
+  # HTTP client to katalog API (item detail, upload segments/chapters,
+  # step bookkeeping, fail). Sync because the consumer processes one item
+  # at a time per worker and there's no fan-out.
   "httpx==0.28.1",
+  # Kafka consumer/producer. The manylinux wheel bundles librdkafka, so no
+  # apt/Dockerfile change is needed on the glibc (cuda/ubuntu) base — pip
+  # pulls the prebuilt wheel.
+  "confluent-kafka==2.5.3",
   # Structured JSON logs that play nicely with the cluster log pipeline.
   "structlog==25.4.0",
   # Tiny FastAPI surface for /healthz + /readyz. uvicorn runs it side-car to

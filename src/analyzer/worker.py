@@ -1,5 +1,18 @@
-"""Worker loop. One python process = one worker. Replicas scale linearly
-because POST /api/analyze/claim is race-free (Postgres SKIP LOCKED)."""
+"""Event-driven analyzer worker.
+
+Each process runs ONE Kafka consumer in the `analyzer-workers` group:
+CONSUME `stube.catalog.item.enriched` -> run the per-file pipeline
+(`analyze_one`, which itself runs tidb + chapters + subtitle + blackframe
++ silence + chromaprint and writes segments/chapters + step statuses)
+-> PRODUCE `stube.catalog.item.analyzed` for the transcoder. Replicas
+scale linearly because the consumer group hands each partition to exactly
+one worker; per-item ordering is preserved by keying every event on the
+item id.
+
+Idempotency: offsets are committed only AFTER the item is fully processed
+AND the next event is produced, so a crash mid-work reprocesses. Rework is
+safe because the katalog (item_id, step) unique index + the per-pipeline
+step-status short-circuit make a second pass a no-op."""
 
 from __future__ import annotations
 
@@ -10,7 +23,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
+from confluent_kafka import Consumer, Producer
 
+from . import kafka
 from .katalog import ClaimedItem, KatalogClient
 from .pipelines import blackframe, chapters, chromaprint, fuser, silence, subtitles, tidb
 
@@ -168,171 +183,194 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
     return AnalyzeResult(segments=fused, chapters=chapter_atoms)
 
 
-def run_worker(client: KatalogClient, batch_size: int, idle_sleep: float, error_sleep: float,
-               stop: threading.Event) -> None:
-    """Blocking loop. Exits when `stop` is set (or process is killed)."""
-    while not stop.is_set():
-        try:
-            batch = client.claim("per_file", batch_size)
-        except Exception as e:
-            log.exception("worker.claim_failed", error=str(e)[:300])
-            stop.wait(error_sleep)
-            continue
-
-        if not batch:
-            stop.wait(idle_sleep)
-            continue
-
-        for item in batch:
-            if stop.is_set():
-                break
-            t0 = time.monotonic()
-            try:
-                result = analyze_one(item, client=client)
-                client.upload_segments(item.id, result.segments)
-                client.upload_chapters(item.id, result.chapters)
-                log.info(
-                    "worker.item_done",
-                    item_id=item.id,
-                    title=item.title,
-                    segments=len(result.segments),
-                    chapters=len(result.chapters),
-                    seconds=round(time.monotonic() - t0, 2),
-                )
-            except FileNotFoundError as e:
-                client.fail(item.id, f"file missing: {e}")
-            except Exception as e:
-                log.exception("worker.item_failed", item_id=item.id, error=str(e)[:300])
-                # Don't fail the item on transient errors — let it stay
-                # in_progress; the janitor will reset stuck rows. For now,
-                # mark failed so we don't infinitely retry the same bug.
-                try:
-                    client.fail(item.id, str(e)[:500])
-                except Exception:
-                    log.exception("worker.fail_report_failed", item_id=item.id)
+# --- Event-driven consumer -------------------------------------------
+# Steps whose terminal status means "this item's analysis pass already
+# ran". These are exactly the pipelines analyze_one bookkeeps. When ALL
+# of them are already in a terminal state we skip the (expensive) rework
+# but STILL produce the analyzed event so the chain isn't stuck. chromaprint
+# is intentionally NOT in the guard set: it only exists for multi-episode
+# series and legitimately never appears for movies / single-episode items,
+# so requiring it would wedge those items forever.
+ANALYZER_STEPS = ("tidb", "chapter", "subtitle", "blackframe", "silence")
+TERMINAL_STATUSES = {"done", "skipped", "not_applicable", "failed"}
 
 
-# --- Stage-1 TIDB-only sweep -----------------------------------------
-# Runs alongside the per_file worker but does *only* the TIDB network
-# call. On a hit + sanity-OK, it marks the per_file ML steps as
-# not_applicable so the slow GPU loop doesn't claim the same item — and
-# uploads TIDB's segments straight away so the player has data within
-# seconds of ingest. On a miss or sanity failure, it leaves every ML
-# step pending and the existing per_file pass picks it up.
-#
-# Why a separate worker:
-#   1. TIDB is rate-limited to 30 req / 10s anonymously; the per_file
-#      pace (1-2 items/min) doesn't even hit that ceiling, but a
-#      dedicated sweep can.
-#   2. The catalog has thousands of items where TIDB has the answer
-#      and we're currently doing 60 s of ffmpeg work to discover that.
-#      Decoupling cuts the time-to-first-data from days to hours.
-#   3. It also makes the per_file worker free to focus on items TIDB
-#      has nothing for — the long tail of niche shows / movies.
+def _already_analyzed(steps: dict[str, str]) -> bool:
+    """True when every analyzer step has a terminal status recorded — the
+    item was analyzed in a prior pass (e.g. a crash after producing the
+    event but before committing the offset). We still re-emit the next
+    event so the chain progresses, but skip the ffmpeg work."""
+    if not steps:
+        return False
+    return all(steps.get(name) in TERMINAL_STATUSES for name in ANALYZER_STEPS)
 
 
-# ML steps the tidb_first pass short-circuits when TIDB has authoritative
-# data. `chapter` is intentionally NOT in this list — chapter atoms feed
-# the ItemChapters entity, which is orthogonal to skippable segments and
-# still useful even when TIDB knows the intro/credits boundaries.
-TIDB_FIRST_SHORT_CIRCUIT_STEPS = ("blackframe", "silence", "subtitle", "chromaprint")
+def _process_item(item: ClaimedItem, client: KatalogClient) -> None:
+    """Run the per-item analysis and write segments + chapters. Raises on
+    an unrecoverable per-item error so the caller can mark it failed."""
+    result = analyze_one(item, client=client)
+    client.upload_segments(item.id, result.segments)
+    client.upload_chapters(item.id, result.chapters)
+    log.info(
+        "worker.item_done",
+        item_id=item.id,
+        title=item.title,
+        segments=len(result.segments),
+        chapters=len(result.chapters),
+    )
 
 
-def run_tidb_first_worker(
+def run_event_consumer(
     client: KatalogClient,
-    batch_size: int,
-    idle_sleep: float,
+    brokers: str,
+    group_id: str,
+    consume_topic: str,
+    produce_topic: str,
+    security_protocol: str,
+    produce_step: str,
     error_sleep: float,
-    claim_interval: float,
     stop: threading.Event,
 ) -> None:
-    """TIDB-only sweep. Same lifecycle contract as `run_worker`: blocks
-    until `stop` is set. Throttles to `claim_interval` seconds between
-    individual TIDB lookups so anonymous-tier rate limits (30 req / 10 s)
-    stay comfortably under the ceiling."""
-    while not stop.is_set():
-        try:
-            batch = client.claim("tidb_first", batch_size)
-        except Exception as e:
-            log.exception("tidb_first.claim_failed", error=str(e)[:300])
-            stop.wait(error_sleep)
-            continue
+    """Blocking Kafka consume->analyze->produce loop. Exits when `stop`
+    is set (or the process is killed).
 
-        if not batch:
-            stop.wait(idle_sleep)
-            continue
+    Per-message flow (replaces the old claim-poll loop):
+      1. Parse the value -> itemId. Malformed messages are logged +
+         committed + skipped (poison messages must not wedge a partition).
+      2. client.get_item(itemId) -> full detail. None/404 => log + commit
+         + skip.
+      3. Idempotency guard: if every analyzer step is already terminal,
+         skip the work but STILL produce the analyzed event, then commit.
+      4. Run analyze_one UNCHANGED (all katalog step/segment/chapter writes
+         are preserved — they are the state the Activity monitor reads).
+      5. Success: produce the analyzed event + flush, THEN commit the
+         offset. Failure: mark the item failed, then commit (avoid a
+         poison-loop). The offset is only committed once we're done, so a
+         crash mid-work reprocesses.
+    """
+    consumer: Consumer | None = None
+    producer: Producer | None = None
+    try:
+        producer = kafka.build_producer(brokers, security_protocol)
+        consumer = kafka.build_consumer(brokers, group_id, security_protocol)
+        consumer.subscribe([consume_topic])
+        log.info(
+            "consumer.started",
+            brokers=brokers,
+            group_id=group_id,
+            consume_topic=consume_topic,
+            produce_topic=produce_topic,
+        )
 
-        for item in batch:
-            if stop.is_set():
-                break
-            t0 = time.monotonic()
+        while not stop.is_set():
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            err = msg.error()
+            if err is not None:
+                if kafka.is_partition_eof(err):
+                    continue
+                log.warning("consumer.poll_error", error=str(err))
+                stop.wait(error_sleep)
+                continue
+
+            _handle_message(
+                consumer, producer, client, msg, produce_topic, produce_step
+            )
+    except Exception as e:
+        # A failure here is fatal to the consumer thread; main's /readyz
+        # goes red once the thread dies so k8s restarts the pod.
+        log.exception("consumer.fatal", error=str(e)[:300])
+        raise
+    finally:
+        if producer is not None:
             try:
-                # Refresh tidb=in_progress as a heartbeat. The claim
-                # endpoint flipped it on dequeue, but if processing
-                # within this worker takes a while we want the timestamp
-                # to keep moving (a janitor sweep would otherwise mark
-                # us stuck).
-                client.upsert_step(item.id, "tidb", "in_progress")
+                producer.flush(10)
+            except Exception:
+                log.warning("consumer.producer_flush_failed")
+        if consumer is not None:
+            consumer.close()
+        log.info("consumer.stopped")
 
-                segments = tidb.detect(
-                    tmdb_id=item.tmdb_id,
-                    season=item.season_number,
-                    episode=item.episode_number,
-                    duration_ms=item.duration_ms,
-                    media_type="movie" if item.type == "movie" else "tv",
-                )
-                # Suppress kinds that don't make sense for this media type
-                # (intro/recap on a standalone movie). Same SUPPRESSED_KINDS
-                # mapping the per_file fuser uses.
-                drop = SUPPRESSED_KINDS.get(item.type, set())
-                if drop:
-                    segments = [s for s in segments if s["kind"] not in drop]
 
-                if not segments:
-                    # TIDB had nothing (404 / empty / dropped by media-type
-                    # filter). Leave every ML step pending so the per_file
-                    # pass picks the item up later.
-                    client.upsert_step(item.id, "tidb", "skipped",
-                                       error="tidb: no submissions for this media")
-                    log.info("tidb_first.miss", item_id=item.id, title=item.title,
-                             seconds=round(time.monotonic() - t0, 2))
-                    continue
+def _handle_message(
+    consumer: Consumer,
+    producer: Producer,
+    client: KatalogClient,
+    msg: Any,
+    produce_topic: str,
+    produce_step: str,
+) -> None:
+    """Process one consumed message end-to-end, committing its offset
+    exactly once when done (success, skip, or handled failure). Errors
+    are contained so one bad item can't kill the loop."""
+    item_id = kafka.parse_item_id(msg.value())
+    if item_id is None:
+        log.warning("consumer.malformed", value=str(msg.value())[:200])
+        consumer.commit(message=msg)
+        return
 
-                ok, reason = tidb.sanity_check(segments, item.duration_ms)
-                if not ok:
-                    client.upsert_step(item.id, "tidb", "failed",
-                                       error=f"sanity_check: {reason}")
-                    log.info("tidb_first.sanity_failed", item_id=item.id,
-                             title=item.title, reason=reason,
-                             seconds=round(time.monotonic() - t0, 2))
-                    continue
+    t0 = time.monotonic()
+    try:
+        item = client.get_item(item_id)
+        if item is None:
+            log.warning("consumer.item_missing", item_id=item_id)
+            consumer.commit(message=msg)
+            return
 
-                # TIDB win: upload the segments (full replace), mark tidb
-                # done, short-circuit the per_file ML steps. We do NOT
-                # upload chapters here — those need ffprobe on the file,
-                # which this worker doesn't have. The chapter step stays
-                # pending; the per_file pass will pick it up and the
-                # short-circuit prevents the other detectors from running
-                # alongside.
-                client.upload_segments(item.id, segments)
-                client.upsert_step(item.id, "tidb", "done",
-                                   details=f"segments={len(segments)} sanity=ok")
-                client.mark_steps_not_applicable(
-                    item.id,
-                    list(TIDB_FIRST_SHORT_CIRCUIT_STEPS),
-                    reason="tidb_first hit, ML detectors redundant",
-                )
-                log.info("tidb_first.hit", item_id=item.id, title=item.title,
-                         segments=len(segments),
-                         seconds=round(time.monotonic() - t0, 2))
-            except Exception as e:
-                log.exception("tidb_first.item_failed", item_id=item.id,
-                              error=str(e)[:300])
-                try:
-                    client.upsert_step(item.id, "tidb", "failed",
-                                       error=str(e)[:500])
-                except Exception:
-                    log.exception("tidb_first.fail_report_failed",
-                                  item_id=item.id)
+        # Idempotency guard: skip the expensive rework if the item was
+        # already fully analyzed, but still emit the next event so the
+        # pipeline advances.
+        if _already_analyzed(client.get_steps(item.id)):
+            log.info("consumer.already_analyzed", item_id=item.id, title=item.title)
+        else:
+            try:
+                _process_item(item, client)
+            except FileNotFoundError as e:
+                client.fail(item.id, f"file missing: {e}")
+                consumer.commit(message=msg)
+                return
 
-            stop.wait(claim_interval)
+        # Produce the next-stage event, flush, THEN commit. If we crash
+        # between produce and commit the item reprocesses harmlessly.
+        _emit_and_commit(
+            consumer, producer, msg, item, produce_topic, produce_step
+        )
+        log.info(
+            "consumer.item_complete",
+            item_id=item.id,
+            seconds=round(time.monotonic() - t0, 2),
+        )
+    except Exception as e:
+        # Unrecoverable per-item error: mark failed and commit so we don't
+        # spin on a poison item. The katalog step rows already carry the
+        # per-pipeline failures analyze_one recorded.
+        log.exception("consumer.item_failed", item_id=item_id, error=str(e)[:300])
+        try:
+            client.fail(item_id, str(e)[:500])
+        except Exception:
+            log.exception("consumer.fail_report_failed", item_id=item_id)
+        consumer.commit(message=msg)
+
+
+def _emit_and_commit(
+    consumer: Consumer,
+    producer: Producer,
+    msg: Any,
+    item: ClaimedItem,
+    produce_topic: str,
+    produce_step: str,
+) -> None:
+    """Produce the analyzed event (keyed by itemId), flush the producer,
+    then commit the consumed offset. Ordering matters: the next stage
+    must see the event before we forget we processed this item."""
+    event = kafka.build_event(
+        item.id,
+        step=produce_step,
+        status="done",
+        type_=item.type,
+        source="analyzer",
+    )
+    kafka.produce_event(producer, produce_topic, event)
+    producer.flush()
+    consumer.commit(message=msg)
