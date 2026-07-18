@@ -42,6 +42,10 @@ class ClaimedItem:
     series_tmdb_id: str | None = None
     movie_tmdb_id: str | None = None
     series_title: str | None = None
+    # Whether the item has its OWN poster/backdrop (ignoring the series
+    # fallback), so the keyframe pipeline only fills genuine gaps.
+    has_own_poster: bool = False
+    has_own_backdrop: bool = False
 
     @property
     def tmdb_id(self) -> str | None:
@@ -98,8 +102,12 @@ class KatalogClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         url = f"{self._base}{path}"
+        extra = kwargs.pop("extra_headers", None)
         for attempt in range(2):
-            resp = self._http.request(method, url, headers=self._headers(), **kwargs)
+            headers = self._headers()
+            if extra:
+                headers.update(extra)
+            resp = self._http.request(method, url, headers=headers, **kwargs)
             if resp.status_code == 401 and attempt == 0:
                 # Token revoked / rotated; force-refresh and retry once.
                 self._token = None
@@ -127,6 +135,8 @@ class KatalogClient:
             series_tmdb_id=it.get("seriesTmdbId"),
             movie_tmdb_id=it.get("movieTmdbId"),
             series_title=it.get("seriesTitle"),
+            has_own_poster=bool(it.get("hasOwnPoster")),
+            has_own_backdrop=bool(it.get("hasOwnBackdrop")),
         )
 
     # ---------------------------------------------------------- uploads
@@ -142,6 +152,26 @@ class KatalogClient:
                 item_id=item_id,
                 status=resp.status_code,
                 body=resp.text[:500],
+            )
+            resp.raise_for_status()
+
+    def put_artwork(
+        self, item_id: str, kind: str, data: bytes, content_type: str = "image/jpeg"
+    ) -> None:
+        """Upload a self-extracted keyframe as the item's poster/backdrop."""
+        resp = self._request(
+            "PUT",
+            f"/api/artwork/{item_id}/{kind}",
+            content=data,
+            extra_headers={"Content-Type": content_type},
+        )
+        if resp.status_code >= 400:
+            log.error(
+                "artwork.upload_failed",
+                item_id=item_id,
+                kind=kind,
+                status=resp.status_code,
+                body=resp.text[:300],
             )
             resp.raise_for_status()
 

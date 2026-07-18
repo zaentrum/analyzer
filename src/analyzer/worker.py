@@ -27,7 +27,7 @@ from confluent_kafka import Consumer, Producer
 
 from . import kafka
 from .katalog import ClaimedItem, KatalogClient
-from .pipelines import blackframe, chapters, chromaprint, fuser, silence, subtitles, tidb
+from .pipelines import blackframe, chapters, chromaprint, fuser, keyframe, silence, subtitles, tidb
 
 # Segment kinds that don't make sense for a given media type. Movies are
 # standalone — they have no recurring theme tune or "Previously on…"
@@ -180,7 +180,44 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
     drop_kinds = SUPPRESSED_KINDS.get(item.type, set())
     if drop_kinds:
         fused = [s for s in fused if s["kind"] not in drop_kinds]
+
+    # Self-thumbnail fallback: for an item TMDB/fanart had no image for, extract a
+    # representative keyframe (avoiding intro/credits + black frames, from the
+    # segments just fused) and submit it as artwork. Best-effort — never fails the
+    # analyze pass.
+    if client is not None:
+        _maybe_extract_keyframe(item, fused, client)
+
     return AnalyzeResult(segments=fused, chapters=chapter_atoms)
+
+
+def _maybe_extract_keyframe(item: ClaimedItem, segments: list[dict], client: KatalogClient) -> None:
+    """Fill a missing poster/backdrop from a video keyframe. Episodes get it as
+    their BACKDROP (poster stays the series image, so each episode shows a unique
+    still); a poster-less movie/series gets it as poster+backdrop. Off via
+    KEYFRAME_ARTWORK=false."""
+    if os.environ.get("KEYFRAME_ARTWORK", "true").lower() == "false":
+        return
+    if item.type == "episode":
+        kinds = [] if item.has_own_backdrop else ["backdrop"]
+    else:  # movie / series
+        kinds = [] if (item.has_own_poster or item.has_own_backdrop) else ["poster", "backdrop"]
+    if not kinds:
+        return
+    try:
+        jpeg = keyframe.extract(item.path, item.duration_ms, segments)
+    except Exception as e:  # noqa: BLE001 - best-effort, must not fail analyze
+        log.warning("keyframe.extract_failed", item_id=item.id, error=str(e)[:200])
+        return
+    if not jpeg:
+        log.info("keyframe.no_usable_frame", item_id=item.id)
+        return
+    for kind in kinds:
+        try:
+            client.put_artwork(item.id, kind, jpeg, "image/jpeg")
+            log.info("keyframe.uploaded", item_id=item.id, kind=kind, bytes=len(jpeg))
+        except Exception as e:  # noqa: BLE001
+            log.warning("keyframe.upload_failed", item_id=item.id, kind=kind, error=str(e)[:200])
 
 
 # --- Event-driven consumer -------------------------------------------
