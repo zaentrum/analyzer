@@ -33,6 +33,10 @@ _CANDIDATES = (0.15, 0.28, 0.40, 0.50, 0.60, 0.72, 0.85)
 
 def extract(path: str, duration_ms: int | None, segments: list[dict]) -> bytes | None:
     """Return JPEG bytes of the best keyframe, or None if none is usable."""
+    if not duration_ms or duration_ms <= 0:
+        # Unmatched items often have no stored duration (TMDB never set a
+        # runtime); probe the file directly so extraction doesn't depend on it.
+        duration_ms = _probe_duration_ms(path)
     window = _content_window(duration_ms, segments)
     if window is None:
         return None
@@ -84,6 +88,22 @@ def _content_window(duration_ms: int | None, segments: list[dict]) -> tuple[floa
     if hi <= lo:
         lo, hi = 0.0, dur
     return lo, hi
+
+
+def _probe_duration_ms(path: str) -> int | None:
+    """ffprobe the container duration in ms; None on failure."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        secs = float(r.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    return int(secs * 1000) if secs > 0 else None
 
 
 def _frame_stats(path: str, ts: float) -> tuple[float, float] | None:
