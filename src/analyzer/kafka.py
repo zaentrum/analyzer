@@ -28,6 +28,7 @@ Consumers only REQUIRE `itemId`; every other field is tolerated/ignored.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -36,6 +37,22 @@ import structlog
 from confluent_kafka import Consumer, KafkaError, Producer
 
 log = structlog.get_logger("analyzer.kafka")
+
+
+def _security_conf(security_protocol: str) -> dict[str, str]:
+    """Kafka security settings. When KAFKA_CERT_DIR points at a mounted
+    mTLS secret (user.crt/user.key + the CLUSTER CA's ca.crt — the shared
+    Strimzi profile), it wins over `security_protocol`: a mounted cert dir
+    IS the operator's way of saying "this broker speaks mTLS"."""
+    cert_dir = os.environ.get("KAFKA_CERT_DIR", "").strip()
+    if cert_dir and os.path.isdir(cert_dir):
+        return {
+            "security.protocol": "SSL",
+            "ssl.ca.location": os.path.join(cert_dir, "ca.crt"),
+            "ssl.certificate.location": os.path.join(cert_dir, "user.crt"),
+            "ssl.key.location": os.path.join(cert_dir, "user.key"),
+        }
+    return {"security.protocol": security_protocol}
 
 
 def now_rfc3339() -> str:
@@ -98,7 +115,7 @@ def build_consumer(brokers: str, group_id: str, security_protocol: str) -> Consu
         {
             "bootstrap.servers": brokers,
             "group.id": group_id,
-            "security.protocol": security_protocol,
+            **_security_conf(security_protocol),
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
             # Keep the broker from evicting us mid-analysis: a per-file
@@ -114,7 +131,7 @@ def build_producer(brokers: str, security_protocol: str) -> Producer:
     return Producer(
         {
             "bootstrap.servers": brokers,
-            "security.protocol": security_protocol,
+            **_security_conf(security_protocol),
             "acks": "all",
             "enable.idempotence": True,
         }
