@@ -12,7 +12,9 @@ item id.
 Idempotency: offsets are committed only AFTER the item is fully processed
 AND the next event is produced, so a crash mid-work reprocesses. Rework is
 safe because the katalog (item_id, step) unique index + the per-pipeline
-step-status short-circuit make a second pass a no-op."""
+step-status short-circuit make a second pass a no-op, and a pass that
+skips passes keeps the segments they found. A retry the catalog sends
+runs only the passes that aren't finished."""
 
 from __future__ import annotations
 
@@ -51,12 +53,18 @@ class AnalyzeResult:
     chapters: list[dict]
 
 
-def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> AnalyzeResult:
+def analyze_one(
+    item: ClaimedItem,
+    client: KatalogClient | None = None,
+    *,
+    short_circuit: frozenset[str] | None = None,
+) -> AnalyzeResult:
     """Run every per-file pipeline against `item.path` and return both
     the fused skippable-segments list (TIDB vocabulary) and the raw
     chapter atoms list. Designed to be exception-safe: an individual
     pipeline raising returns an empty contribution but doesn't kill
-    the worker.
+    the worker. A pipeline whose step has a status in `short_circuit`
+    (default SHORT_CIRCUIT; a retry passes FINISHED_STATUSES) is skipped.
 
     Series episodes additionally get a chromaprint pass that fingerprints
     the file's head + tail and asks katalog for sibling episodes of the
@@ -124,13 +132,15 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
 
     # Skip pipelines whose step has already been answered by a previous
     # pass — `done` (someone wrote the result) or `not_applicable` (the
-    # tidb_first short-circuit told us TIDB already covers this item).
-    # Saves us a full ML cycle on every TIDB-handled item; on a fresh
-    # ingest the map is empty so nothing is skipped.
+    # tidb_first short-circuit told us TIDB already covers this item);
+    # on a retry also `skipped`. Saves us a full ML cycle on every
+    # TIDB-handled item; on a fresh ingest the map is empty so nothing is
+    # skipped.
     pre_existing_status: dict[str, str] = {}
     if client is not None:
         pre_existing_status = client.get_steps(item.id)
-    SHORT_CIRCUIT = {"done", "not_applicable"}
+    if short_circuit is None:
+        short_circuit = SHORT_CIRCUIT
 
     # A chromaprint step that waits for a run (a retry claimed it, a run
     # died, a run failed) which this pass can't make — the episode has no
@@ -151,7 +161,7 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
     kept: list[tuple[str, Callable[[], list[dict]]]] = []
     for name, run in pipelines:
         prior = pre_existing_status.get(name)
-        if prior in SHORT_CIRCUIT:
+        if prior in short_circuit:
             log.info(
                 "pipeline.short_circuit",
                 pipeline=name,
@@ -300,6 +310,19 @@ TERMINAL_STATUSES = {"done", "skipped", "not_applicable", "failed"}
 # A step that waits for a run: not started yet, started by a run that may
 # have died, or failed.
 WAITING_STATUSES = {"pending", "in_progress", "failed"}
+# The statuses a pass leaves alone. A first pass or a redelivery: done and
+# not_applicable (a skipped pass, which found nothing, runs again). A
+# retry — the catalog sent the trigger again for failed or silent steps —
+# leaves every finished one alone: the catalog retries none of them.
+SHORT_CIRCUIT = frozenset({"done", "not_applicable"})
+FINISHED_STATUSES = frozenset({"done", "skipped", "not_applicable"})
+
+
+def _unfinished(steps: dict[str, str]) -> list[str]:
+    """The analyzer's steps a retry has work for: those not finished
+    (chromaprint only for an item that has the step)."""
+    names = [*ANALYZER_STEPS, *(name for name in OPTIONAL_STEPS if name in steps)]
+    return [name for name in names if steps.get(name) not in FINISHED_STATUSES]
 
 
 def _already_analyzed(steps: dict[str, str]) -> bool:
@@ -313,10 +336,12 @@ def _already_analyzed(steps: dict[str, str]) -> bool:
     return all(steps.get(name) in TERMINAL_STATUSES for name in names)
 
 
-def _process_item(item: ClaimedItem, client: KatalogClient) -> None:
+def _process_item(item: ClaimedItem, client: KatalogClient, *, retry: bool = False) -> None:
     """Run the per-item analysis and write segments + chapters. Raises on
-    an unrecoverable per-item error so the caller can mark it failed."""
-    result = analyze_one(item, client=client)
+    an unrecoverable per-item error so the caller can mark it failed. A
+    retry runs only the passes that aren't finished."""
+    result = analyze_one(item, client=client,
+                         short_circuit=FINISHED_STATUSES if retry else SHORT_CIRCUIT)
     if result.segments is not None:
         client.upload_segments(item.id, result.segments)
     client.upload_chapters(item.id, result.chapters)
@@ -350,8 +375,11 @@ def run_event_consumer(
          + skip.
       3. Idempotency guard: if every analyzer step is already terminal,
          skip the work but STILL produce the analyzed event, then commit.
-      4. Run analyze_one UNCHANGED (all katalog step/segment/chapter writes
-         are preserved — they are the state the Activity monitor reads).
+         A retry (the catalog sent the event again for failed or silent
+         steps) whose steps have all finished since is only committed,
+         with one log line; otherwise it runs the unfinished passes.
+      4. Run analyze_one (all katalog step/segment/chapter writes are
+         preserved — they are the state the Activity monitor reads).
       5. Success: produce the analyzed event + flush, THEN commit the
          offset. Failure: mark the item failed, then commit (avoid a
          poison-loop). The offset is only committed once we're done, so a
@@ -418,6 +446,7 @@ def _handle_message(
         log.warning("consumer.malformed", value=str(msg.value())[:200])
         consumer.commit(message=msg)
         return
+    retry = kafka.is_retry(kafka.parse_envelope(msg.value()))
 
     t0 = time.monotonic()
     try:
@@ -427,14 +456,22 @@ def _handle_message(
             consumer.commit(message=msg)
             return
 
+        steps = client.get_steps(item.id)
+        if retry and not _unfinished(steps):
+            # The catalog retried passes that have finished since (a run
+            # the reaper took for dead reported its end after all). That
+            # run passed the chain on: one log line, nothing else.
+            log.info("consumer.retry_already_finished", item_id=item.id)
+            consumer.commit(message=msg)
+            return
         # Idempotency guard: skip the expensive rework if the item was
         # already fully analyzed, but still emit the next event so the
-        # pipeline advances.
-        if _already_analyzed(client.get_steps(item.id)):
+        # pipeline advances. A retry has unfinished passes: it runs them.
+        if not retry and _already_analyzed(steps):
             log.info("consumer.already_analyzed", item_id=item.id, title=item.title)
         else:
             try:
-                _process_item(item, client)
+                _process_item(item, client, retry=retry)
             except FileNotFoundError as e:
                 client.fail(item.id, f"file missing: {e}")
                 consumer.commit(message=msg)

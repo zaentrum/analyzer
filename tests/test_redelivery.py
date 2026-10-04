@@ -16,6 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from analyzer import kafka, worker
 from analyzer.katalog import KatalogClient
@@ -158,6 +159,11 @@ def event(**fields: str) -> dict:
             "source": "katalog-manager", **fields}
 
 
+def retry() -> dict:
+    """The same trigger as the catalog's retry sends it again."""
+    return event(status="retry", source="retry")
+
+
 def run(monkeypatch: pytest.MonkeyPatch, catalog: Catalog, events: list[dict]) -> Broker:
     stop = threading.Event()
     broker = Broker(events, stop)
@@ -280,3 +286,58 @@ def test_a_chromaprint_this_pass_cant_run_gets_its_answer(
     assert "chromaprint" not in found.calls
     assert catalog.step_writes() == [("chromaprint", answer)]
     assert catalog.segment_writes() == []  # nothing new: the stored set stays
+
+
+# ------------------------------------------------------------------ retries
+@pytest.mark.parametrize("steps", [
+    DONE,
+    {**DONE, "chromaprint": "done"},
+    {**DONE, "chromaprint": "skipped", "tidb": "not_applicable"},
+])
+def test_retry_of_finished_passes_is_only_acked(monkeypatch, media, steps) -> None:
+    # The reaper took a long run for dead and the catalog sent the trigger
+    # again; the run reported its end before the retry was consumed. The
+    # retry runs nothing, writes nothing, sends nothing: one log line.
+    catalog = Catalog(media, steps, siblings=True)
+    found = Detectors(monkeypatch)
+    with capture_logs() as logs:
+        broker = run(monkeypatch, catalog, [retry()])
+    assert found.calls == []
+    assert catalog.writes == []
+    assert broker.produced == []
+    assert broker.committed == [0]
+    assert [e["event"] for e in logs if e.get("item_id") == ITEM] == [
+        "consumer.retry_already_finished"]
+
+
+def test_retry_runs_only_the_unfinished_passes(monkeypatch, media) -> None:
+    # blackframe failed and the catalog claimed it for a retry (pending).
+    # Unlike a redelivery, the retry leaves the skipped silence pass alone
+    # too: the catalog retries none of done, skipped and not_applicable.
+    catalog = Catalog(media, {**DONE, "blackframe": "pending"})
+    found = Detectors(monkeypatch)
+    broker = run(monkeypatch, catalog, [retry()])
+    assert found.calls == ["blackframe", "tidb", "subtitle"]  # the last two only to fuse
+    assert catalog.step_writes() == [("blackframe", "in_progress"), ("blackframe", "done")]
+    [segments] = catalog.segment_writes()
+    assert sorted(s["source"] for s in segments) == ["blackframe", "subtitle", "tidb"]
+    # A retry that did work passes the chain on; downstream guards skip
+    # what is done there.
+    assert [t for t, _e in broker.produced] == ["stube.catalog.item.analyzed"]
+    assert broker.committed == [0]
+
+
+def test_retry_of_a_waiting_chromaprint_runs_it(monkeypatch, media) -> None:
+    catalog = Catalog(media, {**DONE, "chromaprint": "pending"}, siblings=True)
+    found = Detectors(monkeypatch)
+    run(monkeypatch, catalog, [retry()])
+    assert found.calls[0] == "chromaprint" and "silence" not in found.calls
+    assert catalog.step_writes() == [("chromaprint", "in_progress"), ("chromaprint", "done")]
+
+
+def test_retry_marker() -> None:
+    assert kafka.is_retry(kafka.parse_envelope(json.dumps(retry()).encode()))
+    assert not kafka.is_retry(kafka.parse_envelope(json.dumps(event()).encode()))
+    assert kafka.parse_envelope(b"not json") == {}
+    assert kafka.parse_envelope(b"[1]") == {}
+    assert kafka.parse_envelope(None) == {}

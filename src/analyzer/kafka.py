@@ -85,6 +85,26 @@ def parse_item_id(raw: bytes | str | None) -> str | None:
     return item_id or None
 
 
+def parse_envelope(raw: bytes | str | None) -> dict[str, Any]:
+    """The decoded envelope, or {} when it isn't a JSON object (a message
+    without an itemId has been skipped already)."""
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        obj = json.loads(raw) if raw is not None else None
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def is_retry(envelope: dict[str, Any]) -> bool:
+    """True for an event the catalog sent again to retry failed or silent
+    steps (status "retry", source "retry"). They may have finished since
+    it was sent — a run the catalog's reaper took for dead that reported
+    done after all — and then there is nothing to do."""
+    return envelope.get("status") == "retry" or envelope.get("source") == "retry"
+
+
 def build_event(
     item_id: str,
     *,
