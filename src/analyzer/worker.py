@@ -107,12 +107,14 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
         ("blackframe", lambda: blackframe.detect(item.path, item.duration_ms)),
         ("silence",    lambda: silence.detect(item.path, item.duration_ms)),
     ]
+    siblings_error: str | None = None
     if item.type == "episode" and client is not None:
         siblings = []
         try:
             siblings = client.siblings(item.id, limit=5)
         except Exception as e:
-            log.warning("chromaprint.siblings_failed", item_id=item.id, error=str(e)[:200])
+            siblings_error = str(e)[:200]
+            log.warning("chromaprint.siblings_failed", item_id=item.id, error=siblings_error)
         if siblings:
             sibling_paths = [s.path for s in siblings if os.path.exists(s.path)]
             pipelines.append((
@@ -129,6 +131,19 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
     if client is not None:
         pre_existing_status = client.get_steps(item.id)
     SHORT_CIRCUIT = {"done", "not_applicable"}
+
+    # A chromaprint step that waits for a run (a retry claimed it, a run
+    # died, a run failed) which this pass can't make — the episode has no
+    # siblings now, or the catalog couldn't list them — gets its answer
+    # here, rather than wait in vain until the reaper times it out.
+    if (client is not None and pre_existing_status.get("chromaprint") in WAITING_STATUSES
+            and all(name != "chromaprint" for name, _ in pipelines)):
+        if siblings_error is not None:
+            client.upsert_step(item.id, "chromaprint", "failed",
+                               error=f"sibling episodes: {siblings_error}")
+        else:
+            client.upsert_step(item.id, "chromaprint", "skipped",
+                               details="no sibling episodes to fingerprint against")
 
     signals: list[list[dict]] = []
     # Pipelines short-circuited as `done`: they found segments in an earlier
@@ -271,12 +286,20 @@ def _maybe_extract_keyframe(item: ClaimedItem, segments: list[dict], client: Kat
 # Steps whose terminal status means "this item's analysis pass already
 # ran". These are exactly the pipelines analyze_one bookkeeps. When ALL
 # of them are already in a terminal state we skip the (expensive) rework
-# but STILL produce the analyzed event so the chain isn't stuck. chromaprint
-# is intentionally NOT in the guard set: it only exists for multi-episode
-# series and legitimately never appears for movies / single-episode items,
-# so requiring it would wedge those items forever.
+# but STILL produce the analyzed event so the chain isn't stuck.
+# chromaprint counts only for an item that has a chromaprint step: it only
+# exists for series episodes with siblings and legitimately never appears
+# for movies / single-episode items, so requiring it would wedge those
+# items forever — but one that has it isn't analyzed while it waits for a
+# run (a retry the catalog sent claims it as pending, and the analyzer
+# used to answer that retry "already analyzed" until the reaper timed the
+# step out).
 ANALYZER_STEPS = ("tidb", "chapter", "subtitle", "blackframe", "silence")
+OPTIONAL_STEPS = ("chromaprint",)
 TERMINAL_STATUSES = {"done", "skipped", "not_applicable", "failed"}
+# A step that waits for a run: not started yet, started by a run that may
+# have died, or failed.
+WAITING_STATUSES = {"pending", "in_progress", "failed"}
 
 
 def _already_analyzed(steps: dict[str, str]) -> bool:
@@ -286,7 +309,8 @@ def _already_analyzed(steps: dict[str, str]) -> bool:
     event so the chain progresses, but skip the ffmpeg work."""
     if not steps:
         return False
-    return all(steps.get(name) in TERMINAL_STATUSES for name in ANALYZER_STEPS)
+    names = [*ANALYZER_STEPS, *(name for name in OPTIONAL_STEPS if name in steps)]
+    return all(steps.get(name) in TERMINAL_STATUSES for name in names)
 
 
 def _process_item(item: ClaimedItem, client: KatalogClient) -> None:

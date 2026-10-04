@@ -88,7 +88,7 @@ class Catalog:
     """The catalog's worker protocol. Step writes update the statuses the
     next read returns, as the real one does."""
 
-    def __init__(self, path: Path, steps: dict[str, str], *, siblings: bool = False) -> None:
+    def __init__(self, path: Path, steps: dict[str, str], *, siblings: bool | str = False) -> None:
         self.path = path
         self.steps = dict(steps)
         self.siblings = siblings
@@ -117,6 +117,8 @@ class Catalog:
         if request.method == "GET" and path == f"/api/analyze/items/{ITEM}/steps":
             return httpx.Response(200, json={"itemId": ITEM, "steps": self.steps})
         if request.method == "GET" and path == f"/api/analyze/items/{ITEM}/siblings":
+            if self.siblings == "error":
+                return httpx.Response(503, text="catalog busy")
             items = [self.detail(SIBLING)] if self.siblings else []
             return httpx.Response(200, json={"itemId": ITEM, "items": items})
         body = json.loads(request.content or b"null")
@@ -232,3 +234,49 @@ def test_partial_pass_keeps_the_segments_when_a_done_pass_cant_find_them_again(
     assert "blackframe" in found.calls
     assert catalog.segment_writes() == []
     assert catalog.step_writes("blackframe")[-1] == ("blackframe", "done")
+
+
+# ----------------------------------------------- chromaprint waiting to run
+@pytest.mark.parametrize(("steps", "analyzed"), [
+    (DONE, True),                                   # no chromaprint step: not required
+    ({**DONE, "chromaprint": "done"}, True),
+    ({**DONE, "chromaprint": "failed"}, True),      # failed is terminal; the retry re-claims it
+    ({**DONE, "chromaprint": "pending"}, False),    # a retry claimed it
+    ({**DONE, "chromaprint": "in_progress"}, False),
+    ({**DONE, "silence": "pending"}, False),
+    ({}, False),
+])
+def test_already_analyzed(steps: dict[str, str], analyzed: bool) -> None:
+    assert worker._already_analyzed(steps) is analyzed
+
+
+def test_a_chromaprint_waiting_for_its_run_runs(monkeypatch, media) -> None:
+    # The catalog retried a failed chromaprint: claimed (pending), its
+    # trigger sent again. Every other pass is finished, which the guard
+    # used to take for "already analyzed": the step stayed pending until
+    # the reaper timed it out.
+    catalog = Catalog(media, {**DONE, "silence": "done", "chromaprint": "pending"}, siblings=True)
+    found = Detectors(monkeypatch, silence=[CREDITS | {"source": "silence"}])
+    broker = run(monkeypatch, catalog, [event()])
+    assert found.calls[0] == "chromaprint"
+    assert catalog.step_writes() == [("chromaprint", "in_progress"), ("chromaprint", "done")]
+    [segments] = catalog.segment_writes()
+    # The whole set: tidb's intro outranks the fingerprinted one.
+    assert sorted((s["kind"], s["source"]) for s in segments) == [
+        ("credits", "blackframe"), ("intro", "tidb"), ("recap", "subtitle")]
+    assert [t for t, _e in broker.produced] == ["stube.catalog.item.analyzed"]
+
+
+@pytest.mark.parametrize(("siblings", "answer"), [(False, "skipped"), ("error", "failed")])
+def test_a_chromaprint_this_pass_cant_run_gets_its_answer(
+    monkeypatch, media, siblings, answer: str,
+) -> None:
+    # The episode has no siblings any more, or the catalog can't list them:
+    # the waiting step is answered instead of left pending for the reaper.
+    catalog = Catalog(media, {**DONE, "silence": "done", "chromaprint": "pending"},
+                      siblings=siblings)
+    found = Detectors(monkeypatch)
+    run(monkeypatch, catalog, [event()])
+    assert "chromaprint" not in found.calls
+    assert catalog.step_writes() == [("chromaprint", answer)]
+    assert catalog.segment_writes() == []  # nothing new: the stored set stays
