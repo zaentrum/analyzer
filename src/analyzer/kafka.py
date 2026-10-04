@@ -15,7 +15,9 @@ Contract (must match across every worker + the hub):
 * CONSUMER: group.id per-worker, enable.auto.commit=false,
   auto.offset.reset=earliest. The offset is committed by the CALLER only
   after the item is fully processed AND the next event is produced, so a
-  crash mid-work reprocesses (idempotent on the katalog side).
+  crash mid-work reprocesses (idempotent on the katalog side). The work
+  runs on the poll thread, so max.poll.interval.ms outlasts the longest
+  run (MAX_POLL_INTERVAL_MS).
 * PRODUCER: acks=all, key = itemId (utf-8) for per-item ordering.
   flush() is called before the caller commits the consumed offset.
 
@@ -37,6 +39,20 @@ import structlog
 from confluent_kafka import Consumer, KafkaError, Producer
 
 log = structlog.get_logger("analyzer.kafka")
+
+# How long the worker may go between two polls before the broker takes
+# its partitions away and gives them — and the item in hand, whose offset
+# is not committed yet — to another replica, which would run the same
+# passes beside the live ones. The work runs on the poll thread, one item
+# at a time. A pass is bounded by its detectors' timeouts, but they add
+# up past an hour (chromaprint over five siblings alone takes up to ~45
+# minutes), and the heartbeat keeps a long pass alive for the catalog's
+# reaper. So the worker holds its partition for as long as librdkafka
+# allows (24 h), as the transcoder and packager do; the reaper, not
+# Kafka, decides when a silent run is dead. The price: a rebalance (a
+# replica joining or leaving) waits until every busy replica has finished
+# its item.
+MAX_POLL_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 
 def _security_conf(security_protocol: str) -> dict[str, str]:
@@ -139,8 +155,8 @@ def build_consumer(brokers: str, group_id: str, security_protocol: str) -> Consu
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
             # Keep the broker from evicting us mid-analysis: a per-file
-            # pass (ffmpeg + optional whisper) can run for minutes.
-            "max.poll.interval.ms": 1_800_000,
+            # pass (ffmpeg + optional whisper) can run for an hour and more.
+            "max.poll.interval.ms": MAX_POLL_INTERVAL_MS,
         }
     )
 

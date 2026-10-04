@@ -391,3 +391,16 @@ def test_heartbeat_interval(monkeypatch, value, every: float) -> None:
     assert worker._heartbeat_seconds() == every
     # Far inside the reaper's 2 h timeout of the analyzer's steps.
     assert worker.HEARTBEAT_SECONDS * 6 <= 2 * 3600
+
+
+# ------------------------------------------------------------------- kafka
+def test_consumer_keeps_its_partition_through_a_long_pass(monkeypatch) -> None:
+    # Evicted mid-pass, a worker's item — offset not committed yet — goes to
+    # another replica, which runs the same passes beside the live ones. A
+    # pass can outlast the old 30 min, and the heartbeat keeps it alive
+    # past the reaper's 2 h: the interval goes up to librdkafka's ceiling.
+    seen: dict = {}
+    monkeypatch.setattr(kafka, "Consumer", lambda conf: seen.update(conf))
+    kafka.build_consumer("broker.test:9092", "analyzer-workers", "PLAINTEXT")
+    assert 2 * 3600 * 1000 < seen["max.poll.interval.ms"] <= 86_400_000
+    assert seen["enable.auto.commit"] is False

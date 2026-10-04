@@ -13,7 +13,11 @@ for the transcoder. It also carries a per-item CMAF packager.
 Each detector is a step: `tidb`, `chapter`, `subtitle`, `blackframe`,
 `silence`, and `chromaprint` for a series episode with siblings. The
 offset is committed only after the item is processed and `analyzed` is
-sent, so a crash reprocesses the event.
+sent, so a crash reprocesses the event. The work runs on the Kafka poll
+thread, and the consumer's `max.poll.interval.ms` is 24 h (librdkafka's
+maximum), so the broker never hands an item in progress to another
+replica; a rebalance (a replica joining or leaving) waits until every
+busy replica has finished its item.
 
 - An event for an item whose steps are all terminal (`done`, `skipped`,
   `not_applicable`, `failed`; `chromaprint` only for an item that has the
