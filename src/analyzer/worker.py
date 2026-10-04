@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,8 +44,10 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class AnalyzeResult:
-    """Output of `analyze_one`: segments + chapters posted to two endpoints."""
-    segments: list[dict]
+    """Output of `analyze_one`: segments + chapters posted to two endpoints.
+    `segments` is None when the pass leaves the catalog's segments as they
+    are (see `_fuse`)."""
+    segments: list[dict] | None
     chapters: list[dict]
 
 
@@ -128,6 +131,9 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
     SHORT_CIRCUIT = {"done", "not_applicable"}
 
     signals: list[list[dict]] = []
+    # Pipelines short-circuited as `done`: they found segments in an earlier
+    # pass, which the catalog holds and this pass doesn't (see _fuse).
+    kept: list[tuple[str, Callable[[], list[dict]]]] = []
     for name, run in pipelines:
         prior = pre_existing_status.get(name)
         if prior in SHORT_CIRCUIT:
@@ -137,7 +143,8 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
                 item_id=item.id,
                 prior_status=prior,
             )
-            signals.append([])
+            if prior == "done":
+                kept.append((name, run))
             continue
         # Step bookkeeping: flip to in_progress before, then done/failed/
         # skipped after. Cheap network call; the worker's main hot path
@@ -174,21 +181,61 @@ def analyze_one(item: ClaimedItem, client: KatalogClient | None = None) -> Analy
             signals.append([])
             if client is not None:
                 client.upsert_step(item.id, name, "failed", error=str(e)[:300])
-    fused = fuser.merge(signals)
-    # Drop segments that don't apply to this media type (e.g. intro on a
-    # movie is always noise — movies aren't a recurring series).
-    drop_kinds = SUPPRESSED_KINDS.get(item.type, set())
-    if drop_kinds:
-        fused = [s for s in fused if s["kind"] not in drop_kinds]
+    fused = _fuse(item, signals, kept)
 
     # Self-thumbnail fallback: for an item TMDB/fanart had no image for, extract a
     # representative keyframe (avoiding intro/credits + black frames, from the
     # segments just fused) and submit it as artwork. Best-effort — never fails the
     # analyze pass.
     if client is not None:
-        _maybe_extract_keyframe(item, fused, client)
+        _maybe_extract_keyframe(item, fused or [], client)
 
     return AnalyzeResult(segments=fused, chapters=chapter_atoms)
+
+
+def _fuse(
+    item: ClaimedItem,
+    signals: list[list[dict]],
+    kept: list[tuple[str, Callable[[], list[dict]]]],
+) -> list[dict] | None:
+    """The item's segments from what this pass's pipelines found, or None to
+    leave the catalog's as they are.
+
+    The catalog replaces an item's whole segment set, so a pass that
+    short-circuited `done` pipelines (`kept`: a redelivery after a crash, a
+    retry of one pass) must not write what its own pipelines found alone —
+    that dropped what the others had found, and all of it when this pass
+    found nothing. Such a pass leaves the segments alone when its pipelines
+    found nothing (they had contributed nothing either: they hadn't run, or
+    failed), and otherwise runs the kept pipelines' detectors again, without
+    touching their steps, to write the whole item's set. A kept pipeline
+    that can't find again what it found (it fails, or finds nothing — tidb
+    answers an outage with nothing) leaves the segments alone rather than
+    have them written without its share. (`chapter` is done for a file with
+    chapter atoms, segments or not, and its detector already ran above.)"""
+    if kept:
+        if not any(signals):
+            log.info("segments.kept", item_id=item.id, reason="nothing new",
+                     pipelines=[name for name, _ in kept])
+            return None
+        for name, run in kept:
+            try:
+                found = run()
+            except Exception as e:
+                log.warning("segments.kept", item_id=item.id, reason=f"{name} failed",
+                            error=str(e)[:300])
+                return None
+            if not found and name != "chapter":
+                log.warning("segments.kept", item_id=item.id, reason=f"{name} found nothing")
+                return None
+            signals = [*signals, found]
+    fused = fuser.merge(signals)
+    # Drop segments that don't apply to this media type (e.g. intro on a
+    # movie is always noise — movies aren't a recurring series).
+    drop_kinds = SUPPRESSED_KINDS.get(item.type, set())
+    if drop_kinds:
+        fused = [s for s in fused if s["kind"] not in drop_kinds]
+    return fused
 
 
 def _maybe_extract_keyframe(item: ClaimedItem, segments: list[dict], client: KatalogClient) -> None:
@@ -246,13 +293,14 @@ def _process_item(item: ClaimedItem, client: KatalogClient) -> None:
     """Run the per-item analysis and write segments + chapters. Raises on
     an unrecoverable per-item error so the caller can mark it failed."""
     result = analyze_one(item, client=client)
-    client.upload_segments(item.id, result.segments)
+    if result.segments is not None:
+        client.upload_segments(item.id, result.segments)
     client.upload_chapters(item.id, result.chapters)
     log.info(
         "worker.item_done",
         item_id=item.id,
         title=item.title,
-        segments=len(result.segments),
+        segments=len(result.segments) if result.segments is not None else "kept",
         chapters=len(result.chapters),
     )
 
