@@ -34,6 +34,11 @@ sent, so a crash reprocesses the event.
 - A `chromaprint` step waiting for a run that the pass can't make (no
   sibling episodes now, or the catalog can't list them) is answered
   `skipped` or `failed` rather than left waiting.
+- While a step runs, the analyzer reports it `in_progress` again every
+  10 minutes (`STEP_HEARTBEAT_SECONDS`, `600`), so the catalog's reaper —
+  which takes a step silent for longer than its timeout, 2 h for the
+  analyzer's, for a dead run and retries it — never reclaims a live one.
+  A step shorter than that reports only its start and its end.
 
 ## Layout
 

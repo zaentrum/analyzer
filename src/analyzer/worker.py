@@ -21,7 +21,8 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +43,50 @@ SUPPRESSED_KINDS = {
 }
 
 log = structlog.get_logger(__name__)
+
+# How often a pass that runs long says again that its step is in progress.
+# The catalog's reaper takes a step silent for longer than its timeout
+# (2 h for the analyzer's) for a dead run, and retries it — a second run
+# beside the live one. A beat every 10 minutes keeps a live run far
+# inside that, through a few failed beats; a pass shorter than that never
+# beats. STEP_HEARTBEAT_SECONDS overrides it (keep it well under the
+# catalog's KATALOG_STEP_TIMEOUTS).
+HEARTBEAT_SECONDS = 600.0
+
+
+def _heartbeat_seconds() -> float:
+    try:
+        every = float(os.environ.get("STEP_HEARTBEAT_SECONDS") or HEARTBEAT_SECONDS)
+    except ValueError:
+        return HEARTBEAT_SECONDS
+    return every if every > 0 else HEARTBEAT_SECONDS
+
+
+@contextmanager
+def _heartbeat(
+    client: KatalogClient | None, item_id: str, step: str, every: float,
+) -> Iterator[None]:
+    """While the body runs, report `step` in progress again every `every`
+    seconds. The beat has stopped, its last report landed, when the body
+    is left — before the caller writes the step's end, which no beat can
+    follow. Reports are best-effort (upsert_step swallows errors)."""
+    if client is None:
+        yield
+        return
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(every):
+            client.upsert_step(item_id, step, "in_progress")
+            log.info("pipeline.heartbeat", pipeline=step, item_id=item_id)
+
+    thread = threading.Thread(target=beat, name=f"heartbeat-{step}", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 @dataclass
@@ -155,6 +200,7 @@ def analyze_one(
             client.upsert_step(item.id, "chromaprint", "skipped",
                                details="no sibling episodes to fingerprint against")
 
+    beat_every = _heartbeat_seconds()
     signals: list[list[dict]] = []
     # Pipelines short-circuited as `done`: they found segments in an earlier
     # pass, which the catalog holds and this pass doesn't (see _fuse).
@@ -172,13 +218,15 @@ def analyze_one(
                 kept.append((name, run))
             continue
         # Step bookkeeping: flip to in_progress before, then done/failed/
-        # skipped after. Cheap network call; the worker's main hot path
-        # is ffmpeg, not these PUTs.
+        # skipped after, and in_progress again every beat_every while the
+        # run lasts (so the reaper never takes it for dead). Cheap network
+        # calls; the worker's main hot path is ffmpeg, not these PUTs.
         if client is not None:
             client.upsert_step(item.id, name, "in_progress")
         try:
             t0 = time.monotonic()
-            sig = run()
+            with _heartbeat(client, item.id, name, beat_every):
+                sig = run()
             signals.append(sig)
             log.info(
                 "pipeline.done",

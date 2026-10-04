@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -132,14 +133,17 @@ class Catalog:
 class Detectors:
     """What each pass finds, and which passes were asked."""
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, **found: list[dict]) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, slow: dict[str, float] | None = None,
+                 **found: list[dict]) -> None:
         self.calls: list[str] = []
         self.found = {"tidb": [INTRO], "subtitle": [RECAP], "blackframe": [CREDITS],
                       "silence": [], "chromaprint": [THEME], **found}
+        self.slow = slow or {}
 
         def recorder(name: str):
             def detect(*_args: object, **_kwargs: object) -> list[dict]:
                 self.calls.append(name)
+                time.sleep(self.slow.get(name, 0))
                 return [dict(s) for s in self.found[name]]
             return detect
 
@@ -341,3 +345,49 @@ def test_retry_marker() -> None:
     assert kafka.parse_envelope(b"not json") == {}
     assert kafka.parse_envelope(b"[1]") == {}
     assert kafka.parse_envelope(None) == {}
+
+
+# ---------------------------------------------------------------- heartbeat
+def test_a_long_pass_says_it_is_alive_until_it_ends(monkeypatch, media) -> None:
+    # The reaper takes a step silent past its timeout for a dead run and
+    # retries it beside the live one. A pass that runs long reports in
+    # progress again every beat, and no beat lands after its end.
+    monkeypatch.setenv("STEP_HEARTBEAT_SECONDS", "0.05")
+    catalog = Catalog(media, {})
+    Detectors(monkeypatch, slow={"blackframe": 0.4})
+    run(monkeypatch, catalog, [event()])
+    time.sleep(0.2)  # a beat that outlived its pass would land by now
+    beats = catalog.step_writes("blackframe")
+    assert beats[0] == ("blackframe", "in_progress")
+    assert beats[-1] == ("blackframe", "done")
+    assert len(beats) >= 1 + 3 + 1  # the start, beats, the end
+    assert set(beats[1:-1]) == {("blackframe", "in_progress")}
+
+
+def test_a_failing_pass_stops_beating_before_it_reports_failure(monkeypatch, media) -> None:
+    monkeypatch.setenv("STEP_HEARTBEAT_SECONDS", "0.05")
+    catalog = Catalog(media, {})
+    Detectors(monkeypatch)
+
+    def crash(*_args: object) -> list[dict]:
+        time.sleep(0.3)
+        raise RuntimeError("ffmpeg died")
+
+    monkeypatch.setattr(silence, "detect", crash)
+    run(monkeypatch, catalog, [event()])
+    time.sleep(0.2)
+    beats = catalog.step_writes("silence")
+    assert beats[-1] == ("silence", "failed")
+    assert len(beats) >= 3 and set(beats[:-1]) == {("silence", "in_progress")}
+
+
+@pytest.mark.parametrize(("value", "every"), [(None, 600.0), ("120", 120.0), ("0", 600.0),
+                                              ("-5", 600.0), ("soon", 600.0)])
+def test_heartbeat_interval(monkeypatch, value, every: float) -> None:
+    if value is None:
+        monkeypatch.delenv("STEP_HEARTBEAT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("STEP_HEARTBEAT_SECONDS", value)
+    assert worker._heartbeat_seconds() == every
+    # Far inside the reaper's 2 h timeout of the analyzer's steps.
+    assert worker.HEARTBEAT_SECONDS * 6 <= 2 * 3600
