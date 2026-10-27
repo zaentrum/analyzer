@@ -5,7 +5,12 @@ Returns two parallel outputs:
   * `segments` — chapters whose title matches one of the TIDB skippable
     kinds (intro / recap / credits). These ride the normal fuser flow
     and end up in com_nalet_katalog_mediasegments alongside detections
-    from the other pipelines.
+    from the other pipelines. An intro or recap chapter says where that
+    segment starts; its range runs to the next chapter mark, which in a
+    file with coarse chapters is the end credits. The fuser takes the
+    range only when it is a plausible length (fuser.SPAN_MS), and
+    otherwise ends the segment where another pipeline does near that
+    start, or drops it.
   * `chapters` — every chapter atom unchanged, including the unlabeled
     "Act 1" / "Cold Open" markers that don't map to a TIDB kind. These
     bypass the fuser and go straight to com_nalet_katalog_itemchapters
@@ -95,7 +100,9 @@ def detect(path: str) -> ChapterResult:
         )
         # When the title matches a TIDB kind, also surface it as a
         # high-confidence segment so the fuser can use it (and the
-        # player's skip-intro / skip-credits buttons fire on it).
+        # player's skip-intro / skip-credits buttons fire on it). The
+        # range is the chapter's, as the file has it: the fuser judges
+        # whether an intro or a recap can be that long.
         kind = _classify_chapter(title)
         if kind is not None:
             segments.append(

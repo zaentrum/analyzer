@@ -302,7 +302,8 @@ def _fuse(
                 log.warning("segments.kept", item_id=item.id, reason=f"{name} found nothing")
                 return None
             signals = [*signals, found]
-    fused = fuser.merge(signals)
+    # The runtime bounds an intro and a recap too (a quarter of it at most).
+    fused = fuser.merge(signals, duration_ms=item.duration_ms)
     # Drop segments that don't apply to this media type (e.g. intro on a
     # movie is always noise — movies aren't a recurring series).
     drop_kinds = SUPPRESSED_KINDS.get(item.type, set())

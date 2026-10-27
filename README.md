@@ -8,6 +8,16 @@ intro/credits detection — writes their segments, chapters and step
 statuses to the catalog API, and emits `stube.catalog.item.analyzed`
 for the transcoder. It also carries a per-item CMAF packager.
 
+## Intro and recap bounds
+
+An intro is 10 s to 3 min long and a recap 10 s to 5 min, neither more
+than a quarter of the runtime: the fuser drops a candidate outside that
+rather than trim it, and never merges candidates into a longer one. A
+chapter titled as an intro or a recap marks where it starts, so one
+that runs longer (a file with coarse chapters, whose next mark is the
+end credits) ends where another detector's candidate near that start
+ends, or gives no segment.
+
 ## Redelivered and retried events
 
 Each detector is a step: `tidb`, `chapter`, `subtitle`, `blackframe`,
