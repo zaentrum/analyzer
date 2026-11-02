@@ -249,6 +249,61 @@ class KatalogClient:
             )
             resp.raise_for_status()
 
+    # ------------------------------------------------------ picture areas
+    def picture_area(self, kind: str, item_id: str) -> dict[str, Any] | None:
+        """The catalog's picture area of an item (kind "items") or an extra
+        ("extras"), and whether it is of what the title plays now
+        ("current"); None when it has none, or the catalog can't say (an
+        older one without the endpoint answers 404 too)."""
+        try:
+            resp = self._request("GET", f"/api/picture/{kind}/{item_id}")
+        except Exception as e:
+            log.warning("picture.get_exception", item_id=item_id, error=str(e)[:200])
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
+    def put_picture_area(self, kind: str, item_id: str, body: dict[str, Any]) -> bool:
+        """Report a measurement of an item's or an extra's picture area (the
+        analyzer's picture.Measurement.report(), or {"released": true} for a
+        claim given back unmeasured). Best-effort: False when the catalog
+        did not take it."""
+        try:
+            resp = self._request("PUT", f"/api/picture/{kind}/{item_id}", json=body)
+        except Exception as e:
+            log.warning("picture.put_exception", item_id=item_id, error=str(e)[:200])
+            return False
+        if resp.status_code >= 400:
+            log.warning("picture.put_failed", item_id=item_id, status=resp.status_code,
+                        body=resp.text[:300])
+            return False
+        return True
+
+    def claim_picture_areas(self, worker: str, limit: int = 1) -> dict[str, Any] | None:
+        """The backfill's next titles to measure (POST /api/picture/claim):
+        {"items": [{"kind", "id", "itemId", "type", "path", "durationMs"}],
+        "deadline"}, or no items and "idle" with "retryAfterSeconds". None
+        when the catalog has no backfill (404, an older one) or fails."""
+        try:
+            resp = self._request(
+                "POST", "/api/picture/claim", json={"worker": worker, "limit": limit}
+            )
+        except Exception as e:
+            log.warning("picture.claim_exception", error=str(e)[:200])
+            return None
+        if resp.status_code != 200:
+            if resp.status_code != 404:
+                log.warning("picture.claim_failed", status=resp.status_code, body=resp.text[:300])
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
     def get_item(self, item_id: str) -> ClaimedItem | None:
         """Fetch one item's FULL analyze detail with its primary playback
         path. Returns None when the item is unknown or has no primary

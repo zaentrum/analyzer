@@ -31,7 +31,17 @@ from confluent_kafka import Consumer, Producer
 
 from . import kafka
 from .katalog import ClaimedItem, KatalogClient
-from .pipelines import blackframe, chapters, chromaprint, fuser, keyframe, silence, subtitles, tidb
+from .pipelines import (
+    blackframe,
+    chapters,
+    chromaprint,
+    fuser,
+    keyframe,
+    picture,
+    silence,
+    subtitles,
+    tidb,
+)
 
 # Segment kinds that don't make sense for a given media type. Movies are
 # standalone — they have no recurring theme tune or "Previously on…"
@@ -341,6 +351,28 @@ def _maybe_extract_keyframe(item: ClaimedItem, segments: list[dict], client: Kat
             log.warning("keyframe.upload_failed", item_id=item.id, kind=kind, error=str(e)[:200])
 
 
+def _measure_picture(item: ClaimedItem, client: KatalogClient) -> None:
+    """Measure the picture area of a movie's or an episode's original and
+    report it to the catalog (pipelines/picture.py), unless the catalog has
+    one of what the title plays now. Not a step: it is best-effort, never
+    fails the item, and the catalog's backfill measures a title this leaves
+    without one. Off with PICTURE_AREA=false."""
+    if os.environ.get("PICTURE_AREA", "true").lower() == "false":
+        return
+    if item.type not in ("movie", "episode"):
+        return
+    try:
+        have = client.picture_area("items", item.id)
+        if have and have.get("current") and have.get("state") in ("measured", "unknown"):
+            log.info("picture.current", item_id=item.id, state=have.get("state"))
+            return
+        m = picture.measure(item.path, item.duration_ms)
+        if not m.interrupted:
+            client.put_picture_area("items", item.id, m.report())
+    except Exception as e:  # never fails the item
+        log.warning("picture.measure_failed", item_id=item.id, error=str(e)[:300])
+
+
 # --- Event-driven consumer -------------------------------------------
 # Steps whose terminal status means "this item's analysis pass already
 # ran". These are exactly the pipelines analyze_one bookkeeps. When ALL
@@ -536,6 +568,10 @@ def _handle_message(
             item_id=item.id,
             seconds=round(time.monotonic() - t0, 2),
         )
+        # The picture area, once the transcoder has its event: it holds up
+        # nothing downstream. A retry runs only the passes that failed.
+        if not retry:
+            _measure_picture(item, client)
     except Exception as e:
         # Unrecoverable per-item error: mark failed and commit so we don't
         # spin on a poison item. The katalog step rows already carry the
