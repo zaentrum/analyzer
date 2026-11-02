@@ -6,7 +6,71 @@ runs a set of per-file detectors — tidb, chapters, silence, blackframe,
 subtitles, and cross-episode audio-fingerprint (chromaprint)
 intro/credits detection — writes their segments, chapters and step
 statuses to the catalog API, and emits `stube.catalog.item.analyzed`
-for the transcoder. It also carries a per-item CMAF packager.
+for the transcoder. It measures each title's picture area, and the
+catalog's backfill of the titles that have none. It also carries a
+per-item CMAF packager.
+
+## Picture area
+
+Many sources keep a full frame with a wider picture letterboxed inside
+it, black bars baked into the video (a 1920x1080 frame whose picture is
+1920x804), or a narrower one pillarboxed. The players fit the picture
+area to the screen, not the frame. The analyzer measures it once and
+reports it to the catalog (`PUT /api/picture/items/{id}`, an extra's
+`/api/picture/extras/{id}`), in pixels with the frame it measured; the
+package stays as it is.
+
+The area is the union of the picture over the whole title: never smaller
+than the picture of a scene sampled, so a film whose aspect changes keeps
+the largest, and a bar counts only where it is black throughout. Cutting
+the picture is far worse than missing a crop, so a side whose edge is in
+doubt keeps the full frame. `pipelines/picture.py` samples a frame every
+10 s of the title (24 to 720 of them), each decoded on its own: of an
+original, the first frame ffmpeg can show after seeking there; of a
+package's video rendition (its HLS playlist), a segment's first frame,
+its init segment and the segment cut right after that frame, so a sample
+reads one frame. ffmpeg reduces a frame to 32 segment means per row and
+per column, and per side:
+
+- a row (a column) is picture when half its segments are 10 levels above
+  black, black being the frame's outermost lines; the edge is the
+  outermost picture row of any sample, so dark scenes and fades never
+  shrink the area;
+- the edge is kept only where at least 3 samples, and 3 % of those with
+  a picture, reach it; else that side keeps the full frame;
+- anything 8 levels above black on two adjacent lines of the bar, beyond
+  a guard band at the edge, in any sample, a black one too, keeps that
+  side whole: subtitles or captions burned into the bar, a dim picture,
+  specks; noise in a bar averages out in a segment;
+- a logo is left out: a mark in the bar in at least half the samples,
+  spanning at most a quarter of the side;
+- what lies in the guard band (ringing at a bright edge) widens the area.
+
+The edges are rounded outwards to even pixels. Too few samples with a
+picture, or a rotated video, can't be told (`reason`); a video that
+can't be read fails (`error`). The analyze pass measures a movie or an
+episode's original once its `analyzed` event is sent, unless the catalog
+has an area of what the title plays now (`GET /api/picture/items/{id}`);
+it is no step and never fails the item. A retry measures nothing.
+
+The backfill (`backfill.py`) is a thread that asks the catalog for the
+titles that have no area (`POST /api/picture/claim`), at the catalog's
+pace and outside its quiet hours, measures what it is handed (the
+package where there is one, else the original), and reports each. A
+measurement still running at the claim's deadline gives its title back
+(`{"released": true}`), and the catalog hands it out again later.
+
+`PICTURE_AREA=false` turns off the analyze pass's measurement,
+`PICTURE_BACKFILL=false` the backfill, `PICTURE_WORKERS` (default `2`)
+is how many samples are decoded at once, and `PICTURE_INTERVAL_S`
+(default `10`, 1 to 120) how far apart they are. Each report says what it
+cost (`seconds`, `cpuSeconds`, `durationMs` of the video). Measured on a
+shared workstation at background priority (an upper bound, not a speed),
+with a 10-bit HEVC source and grain at 11 Mbit/s: about 0.23 s of CPU a
+sample of a package, 0.48 s of an original (it decodes the two frames
+after the keyframe, which the decoder needs to give it out), so about
+80 s and 175 s of CPU an hour of film; a package's sample reads about a
+quarter of a megabyte.
 
 ## Intro and recap bounds
 
@@ -59,10 +123,11 @@ busy replica has finished its item.
 ```
 src/analyzer/main.py              # entry point (uvicorn /healthz + /readyz side-car to worker loop)
 src/analyzer/worker.py            # claim/process loop
+src/analyzer/backfill.py          # the picture-area backfill: the titles the catalog hands out
 src/analyzer/config.py            # env-driven config
-src/analyzer/katalog.py           # catalog API client (claim, upsert step, fail)
+src/analyzer/katalog.py           # catalog API client (claim, upsert step, fail, picture areas)
 src/analyzer/packager.py          # per-item CMAF packager (shaka-packager, HEVC passthrough)
-src/analyzer/pipelines/           # chapters, silence, blackframe, subtitles, chromaprint, tidb, fuser
+src/analyzer/pipelines/           # chapters, silence, blackframe, subtitles, chromaprint, tidb, fuser, picture
 k8s/                              # Deployment, Service, ServiceAccount, ServiceMonitor, GrafanaDashboard
 Dockerfile
 ```
@@ -73,6 +138,12 @@ Dockerfile
 uv sync
 uv run pytest
 ```
+
+The picture-area tests make short videos with ffmpeg (`tests/test_picture.py`:
+a letterbox, a pillarbox, a windowbox, a dark scene and a fade, an aspect
+change, grain in the bars, a subtitle and a logo in a bar, a full frame,
+and a package of fMP4 segments); they are skipped without an ffmpeg that
+encodes H.264.
 
 ## Build the container
 
