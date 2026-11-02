@@ -1,5 +1,7 @@
 """Entry point. One process runs:
   - the Kafka event-consumer loop (thread)
+  - the picture-area backfill (thread): the titles the catalog hands out
+    to have their picture area measured, at the catalog's pace
   - a per-item packaging consumer (thread, fed by the FastAPI endpoint)
   - a tiny FastAPI server for /healthz and /readyz, so k8s probes work.
 The event consumer is the actual job; the HTTP server is just kubelet
@@ -8,8 +10,10 @@ plumbing plus the on-demand packaging trigger."""
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import signal
+import socket
 import sys
 import threading
 
@@ -17,6 +21,7 @@ import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
+from . import backfill
 from .config import Config
 from .katalog import KatalogClient
 from .packager import package_item, package_status
@@ -86,6 +91,26 @@ def main() -> int:
         name="analyzer-consumer",
     )
     worker_thread.start()
+
+    # The picture-area backfill: the catalog hands out the titles it has no
+    # picture area of, at its pace and outside its quiet hours (its settings
+    # picture.backfill*); off here with PICTURE_BACKFILL=false. Its own
+    # client: the two threads never share a request.
+    backfill_thread: threading.Thread | None = None
+    if os.environ.get("PICTURE_BACKFILL", "true").lower() != "false":
+        backfill_client = KatalogClient(
+            base_url=cfg.katalog_api_url,
+            token_url=cfg.oidc_token_url,
+            client_id=cfg.oidc_client_id,
+            client_secret=cfg.oidc_client_secret,
+        )
+        backfill_thread = threading.Thread(
+            target=backfill.run,
+            args=(backfill_client, stop, socket.gethostname()),
+            daemon=True,
+            name="analyzer-picture-backfill",
+        )
+        backfill_thread.start()
 
     # Per-item packaging queue. A single consumer thread runs one
     # shaka-packager invocation at a time — packaging is CPU-bound and
@@ -168,6 +193,9 @@ def main() -> int:
     client.close()
     worker_thread.join(timeout=15)
     pkg_thread.join(timeout=10)
+    if backfill_thread is not None:
+        # A measurement stops at its next sample and gives its title back.
+        backfill_thread.join(timeout=15)
     return 0
 
 
