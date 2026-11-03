@@ -255,6 +255,14 @@ def test_a_deep_blue_open_matte_shot_keeps_the_full_frame(media: Path) -> None:
     assert measure(bare, 400_000).area == FULL
 
 
+def test_full_range_video_has_its_bars_at_zero(media: Path) -> None:
+    f = Film()
+    f.wide(360)
+    enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-g", "20",
+           "-pix_fmt", "yuvj420p", "-color_range", "pc"]  # fmt: skip
+    near(measure(f.render(media / "fullrange.mkv", enc=enc), 360_000), T239)
+
+
 def test_ten_bit_video_is_measured_as_eight(media: Path) -> None:
     f = Film()
     f.wide(360)
@@ -338,6 +346,13 @@ def test_a_windowbox_is_its_picture(media: Path) -> None:
     near(measure(f.render(media / "windowbox.mkv"), 360_000), Box(64, 18, 192, 144))
 
 
+def test_a_narrow_picture_in_a_scope_letterbox_is_its_picture(media: Path) -> None:
+    f = Film()
+    for _ in range(4):
+        f._add(f"testsrc2=s=176x{PIC}:r=2:d=90,{f._noise()},pad={W}:{H}:72:{TOP}:black", 90)
+    near(measure(f.render(media / "postage.mkv"), 360_000), Box(72, TOP, 176, PIC))
+
+
 def test_a_trailer_of_mixed_shots_keeps_the_full_frame(media: Path) -> None:
     f = Film(fps=24)
     for _ in range(6):
@@ -399,6 +414,18 @@ def test_an_anamorphic_dvd_says_its_pixels(media: Path) -> None:
     near(m, Box(0, 36, 360, 216))
     assert m.frame == Box(0, 0, 360, 288) and m.video["sar"] == "64:45"
     assert m.sampling["mode"] == "keyframes" and m.video["codec"] == "mpeg2video"
+
+
+def test_an_interlaced_dvd_program_stream_is_decoded_through(media: Path) -> None:
+    path = media / "dvd.mpg"
+    if not path.exists():
+        ff("-f", "lavfi", "-i", "testsrc2=s=360x216:r=50:d=120",
+           "-vf", "noise=alls=5:allf=t+u,pad=360:288:0:36:black,tinterlace=mode=interleave_top,"
+           "setsar=64/45,fieldorder=tff", "-c:v", "mpeg2video", "-q:v", "4", "-g", "12",
+           "-flags", "+ilme+ildct", "-top", "1", "-f", "vob", str(path))  # fmt: skip
+    m = measure(path, 120_000)
+    assert m.sampling["mode"] == "sequential"
+    near(m, Box(0, 36, 360, 216), ring=8)
 
 
 def test_an_interlaced_transport_stream_is_sampled_on_a_grid(media: Path) -> None:
