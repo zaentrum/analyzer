@@ -24,34 +24,43 @@ package); the package stays as it is.
 The area is the union of the picture over the whole title: never smaller
 than the picture of a scene sampled, so a film whose aspect changes keeps
 the largest, and a bar counts only where it is black throughout. Cutting
-the picture is far worse than missing a crop, so a side in doubt keeps
-the full frame.
+the picture is far worse than missing a crop: a measurement in doubt says
+it can't tell, and the players fit the whole frame.
+
+A title's bar black is read first: the edges of 24 frames spread over it,
+the median of their outermost lines' luma, per side, when that is a black
+(at most 40, its chroma neutral). Each frame is then read against it, not
+against its own edge: a flat dark grey edge of an open-matte shot is no
+bar where the title's bars are black.
 
 What is sampled (`pipelines/picture/sources.py`), from the file opened
-once (PyAV), over the whole of its own length:
+once (PyAV), each sample labelled with its frame's own time:
 
-- keyframes, no two picked more than 2.9 s apart wherever the video's
-  keyframes allow, so a shot of 3 s or more that starts with one (an
-  encoder puts one at most cuts) holds a sample: of an original by its
-  container's index (Matroska's cues, MP4's sample table), a seek to
-  each and the keyframe decoded alone; without an index (MPEG-TS,
-  MPEG-PS) on a grid of the same step; of a package's video rendition
-  (its HLS playlist of fMP4 segments) by its fragments' sync samples,
-  each read by its byte range and decoded with the init segment's
-  configuration;
+- of an original with an index of its keyframes (Matroska's cues, MP4's
+  sample table), every keyframe (one every half second at most: an
+  intra-only file is every frame a keyframe), a seek to each and the
+  keyframe decoded alone, so every shot that starts with one, as an
+  encoder puts one at most cuts, holds its first frame; the groups of
+  pictures longer than 2.9 s, from one keyframe to the next, decoded
+  through (their reference frames), so no two samples are more than 2.9 s
+  apart anywhere;
+- of an original without one (MPEG-TS, MPEG-PS, a Matroska file without
+  cues or cut short), the whole file in its order, each group of pictures
+  held until the next keyframe says how long it is: its keyframe alone
+  when it is short, decoded through when it is long;
+- of a package's video rendition (its HLS playlist of fMP4 segments), its
+  fragments' sync samples, no two picked more than 2.9 s apart where they
+  allow it, each read by its byte range and decoded with the init
+  segment's configuration, coarse to fine within a budget of 1 GiB an hour
+  of film (`PICTURE_READ_MB_PER_HOUR`);
 - twelve stretches spread over the title, 2 % of it together (4 to 20 s
-  each), decoded through, a sample every half second: what changes
-  within a shot, a subtitle burned into a bar, has no keyframe of its
-  own;
-- a title of five minutes or less (512 MiB at most) is decoded through,
-  a sample a second.
+  each), decoded through, a sample every half second: what changes within
+  a shot for less than 3 s, a subtitle burned into a bar;
+- a title of five minutes or less (512 MiB at most) is decoded through, a
+  sample a second.
 
-The keyframes are read coarse to fine (every 16th over the whole title
-first, then every 8th, the stretches, every 4th, the rest), within a
-budget of 1 GiB an hour of film (`PICTURE_READ_MB_PER_HOUR`) besides
-opening the file: a title whose keyframes take more keeps an even,
-coarser coverage, and the report says its samples' largest gap
-(`sampling.maxGapS`) and the budget's stop.
+An original's reads have no budget but twice its size; one can be set
+(`PICTURE_ORIGINAL_READ_MB_PER_HOUR`).
 
 A frame is read from its own Y, U and V planes (`planes.py`), 32 segment
 means per line scaled to 8 bits, so its chroma counts (a deep blue sky of
@@ -60,27 +69,32 @@ whatever ffmpeg is installed. The rules (`rules.py`) keep counts, not
 frames: the same memory for ten samples or six thousand.
 
 - A line is bar in a sample when its mean lies within 2 levels of the
-  black of that side's outermost line, no segment of it is 3 levels (its
-  chroma 4) away from that, and that black is a black (luma at most 40,
-  chroma neutral).
+  title's bar black of its side and no segment of it is 3 levels (its
+  chroma 4) away from that; a side whose edges hold no black has no bar.
 - The edge is the outermost picture line of any sample (the union): a
-  dark scene, a fade or a black frame adds nothing, a wider shot, a
-  subtitle or a caption in the bar widens it.
+  dark scene or a black frame adds nothing, a wider shot, a subtitle or a
+  caption in the bar widens it.
 - Where enough samples show the bar's edge (3, and 3 % of those that
   show a picture), what fewer show up to 1.5 % of the side further out
   (ringing at a bright edge, a blocky frame) widens the area; further out
   it is another picture than most samples show, and that side keeps the
   full frame. A stretch's samples widen the union and support no edge.
 - A logo is left out: a mark in a corner of the bar, never in its middle,
-  in at least half the samples, in the same place and the same shape.
+  in at least 80 % of the samples, in the same place and the same shape (a
+  mark that moves between corners is in neither long enough).
 - The bars of an axis are kept only together and near the same (0.6 % of
   the side, 4 lines at least): a lone bar or a lopsided pair keeps the
   axis whole.
 
-The edges are rounded outwards to even pixels. Too few samples with a
-picture, a rotated video, or one with no video stream can't be told
-(`reason`); a video that can't be read, more than 3 % of the samples
-failing, or a file that changes while it is read fails (`error`).
+The edges are rounded outwards to even pixels. A measurement says it
+can't tell (`reason`, and `sampling.doubt`) when its samples are more than
+3 s apart anywhere in the title, from its start to its end (`gap`), when
+the read budget stopped it (`budget`), when a seek decoded another frame
+than the keyframe it sought (`missed`), or when one landed on a frame
+another sample took (`duplicates`); also with too few samples that show a
+picture, a rotated video, or one with no video stream. A video that can't
+be read, more than 3 % of the samples failing, or a file that changes
+while it is read fails (`error`).
 
 A measurement runs in its own process (`child.py`) at nice 10, stopped at
 its deadline or when the worker stops (`measure.py`), which reads its CPU
@@ -91,39 +105,47 @@ is one thread: the event consumer hands it each movie or episode once its
 has an area of what the title plays now of this method (`GET
 /api/picture/items/{id}`); while none waits, it claims the backfill's
 titles (`POST /api/picture/claim`, naming its method), at the catalog's
-pace and outside its quiet hours, the package where there is one, and
+pace and outside its quiet hours, the original while there is one, and
 reports each with its claim's token. A measurement still running at the
 claim's deadline, or when the worker stops, gives its title back
 (`{"released": true}`). `PICTURE_AREA=false` leaves the pass's titles out,
 `PICTURE_BACKFILL=false` the backfill, and `PICTURE_THREADS` (1) is the
 decoder's threads.
 
-What it costs, measured on synthetic 20-minute titles (1080p, 24 fps, a
-2.39 picture, heavy grain, H.264 at 8 Mbit/s with B-frames, a keyframe at
-every cut and every 10 s besides, 5.1 AAC) on a shared workstation at
+What it costs, measured on synthetic titles on a shared workstation at
 background priority, so on its efficiency cores: the CPU is an upper
-bound, not a speed; the bytes are what any machine reads.
+bound, not a speed; the bytes are what any machine reads. The film is 20
+minutes of 1080p at 24 fps, a 2.39 picture with heavy grain, H.264 at
+8 Mbit/s with B-frames, shots of 2 to 14 s with a keyframe at each cut,
+5.1 AAC.
 
 | the title | sampled | samples | largest gap | read (to open) | read an hour | CPU an hour | peak memory |
 |---|---|---|---|---|---|---|---|
-| Matroska with a 20 MiB font | keyframes | 402 | 10 s | 173 MiB (21) | 518 MiB | 151 s | 205 MiB |
-| MP4 | keyframes | 408 | 10 s | 150 MiB (1.3) | 449 MiB | 151 s | 104 MiB |
-| MPEG-TS | grid, budget reached | 113 | 30 s | 347 MiB (1.3) | 1040 MiB | 80 s | 102 MiB |
-| its package: an encoded rung, 5 Mbit/s, an IDR every 6 s | sync samples | 299 | 6 s | 81 MiB | 243 MiB | 102 s | 98 MiB |
+| the film in Matroska with a 20 MiB font | keyframes, long groups decoded through | 650 | 2.9 s | 1225 MiB (21) | 3.6 GiB | 1159 s | 210 MiB |
+| the same, as mkvmerge writes it | keyframes, long groups decoded through | 650 | 2.9 s | 1225 MiB (21) | 3.6 GiB | 1138 s | 210 MiB |
+| the film in MP4 | keyframes, long groups decoded through | 650 | 2.9 s | 1197 MiB (1.3) | 3.5 GiB | 1112 s | 95 MiB |
+| the film in MPEG-TS | in its order, long groups decoded through | 667 | 2.9 s | 1312 MiB (1.3) | 3.8 GiB | 1086 s | 109 MiB |
+| its package: an encoded rung, H.264 at 5 Mbit/s, an IDR every 6 s | sync samples: can't tell | 302 | 6.0 s | 84 MiB | 251 MiB | 107 s | 87 MiB |
+| 6 min of 4K HEVC 10-bit at 46 Mbit/s, a keyframe a second | keyframes | 408 | 1.0 s | 690 MiB (1.1) | 6.7 GiB | 3624 s | 286 MiB |
 
-A keyframe takes 70 ms to decode at 1080p (H.264) and 213 ms at 4K (HEVC,
-10 bits), its reduction 21 ms and 85 ms, at that priority. A seek in a
-transport stream reads on to the next keyframe, up to 10 s of a film's,
-so such a film reaches the budget with a coarser coverage; a broadcast's
-keyframes come every half second or second.
+An original whose groups of pictures are longer than 2.9 s, a film whose
+shots are, is read whole and its reference frames decoded. A disc's remux
+has a keyframe a second or so and is read by its keyframes: at 4K (HEVC,
+10 bits) 0.7, 0.9 and 1.4 MiB a keyframe at 31, 46 and 62 Mbit/s, each
+decoded in 0.34 to 0.41 s and reduced in 0.11 s at that priority, so an
+hour of such a film reads 2.4 to 5 GiB of keyframes (a sixth to a fifth of
+it) in 27 to 31 min of CPU, its stretches (2 % of it) some 0.4 GiB and
+5 min more; the six-minute title above spends half of its reads and CPU on
+its stretches. A measurement has to end within its deadline, the pass's
+(`PICTURE_PASS_DEADLINE_S`) or the claim's (the catalog's lease); its
+report says what it took (`seconds`, `cpuSeconds`).
 
-What stays unseen: a shot shorter than the spacing of the keyframes
-around it that holds none of them (in a package's encoded rung, an IDR
-every 6 s and none at a cut, one of 3 to 6 s, unless a stretch covers it;
-in a file whose encoder put no keyframe at its cuts), what changes within
-a shot outside the stretches (a caption in a bar once), and, where the
-budget stops the keyframes, what lies between the samples taken (said in
-`sampling.maxGapS`).
+What stays unseen: what changes within a shot for less than 3 s, between
+two samples and outside the stretches (a caption shown once in a bar). A
+package's encoded rung can't tell, nor can an original the budget stopped,
+nor a file whose duration runs on more than 3 s past its video's last
+frame (its audio longer, the file cut short): the players fit their whole
+frame.
 
 ## Intro and recap bounds
 
