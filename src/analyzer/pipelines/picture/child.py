@@ -6,10 +6,11 @@ reaps it; whatever the decoder does, it can't hold the worker up.
 
 A measurement never says an area while it is in doubt: it says it can't
 tell (reason; sampling.doubt names why) when its samples are more than
-MAX_GAP_S apart anywhere in the title, when the read budget stopped it,
-when a seek decoded another frame than the keyframe it sought, or when a
-frame was decoded twice where another was due. The players then fit the
-whole frame, as without an area.
+sources.MAX_GAP_S apart anywhere in the title (from where its picture starts
+to where it ends, after the gaps were decoded frame by frame), when the read
+budget stopped it, when a seek decoded another frame than the keyframe it
+sought, or when a frame was decoded twice where another was due. The players
+then fit the whole frame, as without an area.
 
 The one area it says before it has every sample is the whole frame: as soon
 as every side's picture reaches the frame's edge (rules.Accumulator.at_edges)
@@ -33,8 +34,6 @@ NICE = 10
 # Samples that may fail, as a share of those tried (and at least one), for
 # a measurement still to say anything.
 FAIL_SHARE = 0.03
-# No two samples further apart than this, the title's start and end too.
-MAX_GAP_S = 3.0
 
 
 def run(path: str, duration_ms: int | None = None, probe: bool = False) -> dict[str, Any]:
@@ -139,11 +138,11 @@ def doubts(sm: sources.Sampling) -> tuple[list[str], list[str]]:
     if gap is None:
         codes.append("gap")
         why.append("no sample was taken")
-    elif gap[0] > MAX_GAP_S:
+    elif gap[0] > sources.MAX_GAP_S:
         codes.append("gap")
         why.append(
             f"its samples are up to {gap[0]:.1f} s apart (from {gap[1]:.1f} s), "
-            f"more than {MAX_GAP_S:g} s"
+            f"more than {sources.MAX_GAP_S:g} s"
         )
     if sm.missed:
         codes.append("missed")
@@ -178,7 +177,7 @@ def _measured_on(src: Any, ident: list[Any]) -> dict[str, Any]:
 
 def _sampling(sm: sources.Sampling) -> dict[str, Any]:
     gap = sm.max_gap()
-    return {
+    out: dict[str, Any] = {
         "mode": sm.mode,
         "durationS": round(sm.duration_s, 3),
         "planned": sm.planned,
@@ -195,6 +194,22 @@ def _sampling(sm: sources.Sampling) -> dict[str, Any]:
         "budgetBytes": sm.budget,
         "stopped": sm.stopped,
     }
+    # where the gaps are reckoned from and to, when it is not the video's
+    # start and its file's end
+    if sm.video_start_s is not None and sm.video_start_s > 0.0005:
+        out["videoStartS"] = round(sm.video_start_s, 3)
+    if sm.video_end_s is not None:
+        out["videoEndS"] = round(sm.video_end_s, 3)
+    if sm.data_end_s is not None:
+        out["dataEndS"] = round(sm.data_end_s, 3)
+    if sm.closed:
+        out["closed"] = {
+            "runs": sm.closed,
+            "frames": sm.closed_frames,
+            "bytes": sm.closed_bytes,
+            "cpuSeconds": round(sm.closed_cpu_s, 2),
+        }
+    return out
 
 
 def main(argv: list[str]) -> int:

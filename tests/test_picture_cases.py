@@ -721,6 +721,9 @@ def test_a_file_cut_short_cant_be_told(media: Path) -> None:
         path.write_bytes(data[: int(len(data) * 0.6)])
     m = picture.measure(str(path), 400_000)
     assert m.area is None and "gap" in (m.sampling.get("doubt") or []), (m.reason, m.error)
+    # its tail read to the end of the file: it stops where the video does,
+    # long before the end the file says, so that end stays
+    assert "videoEndS" not in m.sampling and m.sampling.get("dataEndS", 0) < 245, m.sampling
     # what is left shows a picture in the whole frame: the area is that,
     # whatever the rest held
     src = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
@@ -729,6 +732,105 @@ def test_a_file_cut_short_cant_be_told(media: Path) -> None:
         data = src.read_bytes()
         path.write_bytes(data[: int(len(data) * 0.6)])
     whole_by(picture.measure(str(path), 400_000), (186, 194))
+
+
+# ------------------------------------------- its head, its tail, one gap
+def with_sound(video: Path, out: Path, seconds: float) -> Path:
+    """video with a sound track of seconds, in out's container."""
+    if not out.exists():
+        ff("-i", str(video), "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+           "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "24k",
+           *(["-f", "mpegts"] if out.suffix == ".ts" else []), str(out))  # fmt: skip
+    return out
+
+
+@pytest.mark.parametrize("end", ["first", "last"])
+def test_a_first_or_last_group_of_7_s_keeps_the_area(media: Path, end: str) -> None:
+    # Its next keyframe 7 s after its first, or its last 7 s before its end:
+    # that group of pictures is decoded through.
+    at = 7 if end == "first" else 393
+    m = measure(wide_film(media, f"{end}7", 400, {at: ("wide", 400 - at)}), 400_000)
+    near(m, T239)
+    assert m.sampling["doubt"] == [] and m.sampling["maxGapS"] <= 2.9
+
+
+@pytest.mark.parametrize("ext", ["mkv", "mp4", "ts"])
+def test_sound_past_the_last_frame_keeps_the_area(media: Path, ext: str) -> None:
+    # Its last group of pictures runs 7 s, and its sound 7 s past its last
+    # frame: the file says 407 s. Its tail, decoded to the end of the file,
+    # has no frame after 399.5 s, and its sound runs on to the end the file
+    # says: the title ends at its video's last frame.
+    video = wide_film(media, "last7", 400, {393: ("wide", 7)})
+    m = measure(with_sound(video, media / f"last7-sound.{ext}", 407), 407_000)
+    near(m, T239)
+    s = m.sampling
+    assert s["doubt"] == [] and s["maxGapS"] <= 2.9, m.reason
+    assert s["durationS"] == pytest.approx(407, abs=0.2) and s["dataEndS"] >= 406.5
+    assert s["videoEndS"] == pytest.approx(399.5, abs=0.1) and s["closed"]["runs"] == 1
+
+
+@pytest.mark.parametrize("ext", ["mkv", "mp4", "ts"])
+def test_a_video_starting_inside_a_group_of_pictures_starts_at_its_first_keyframe(
+    media: Path, ext: str
+) -> None:
+    # Copied from 3 s into a film with a keyframe every 10 s, its frames
+    # before the first keyframe kept: its first 7 s lack their reference
+    # frames. Decoded from the file's start, none of them is made exactly,
+    # and its picture starts at 7 s.
+    src = wide_film(media, "wide403", 403, {})
+    path = media / f"inside.{ext}"
+    if not path.exists():
+        ff("-i", str(src), "-ss", "3", "-c", "copy", "-copyinkf",
+           *(["-f", "mpegts"] if ext == "ts" else []), str(path))  # fmt: skip
+    m = measure(path, 400_000)
+    near(m, T239)
+    assert m.sampling["mode"] == ("stream" if ext == "ts" else "keyframes")
+    assert m.sampling["videoStartS"] == pytest.approx(7, abs=0.1)
+    assert m.sampling["doubt"] == [] and m.sampling["maxGapS"] <= 2.9
+
+
+def test_one_long_group_whose_reference_frames_are_far_apart_is_decoded_frame_by_frame(
+    media: Path,
+) -> None:
+    # A keyframe every 2 s but none from 200 s to 220 s, and 16 B-frames that
+    # are no reference between two frames that are (8.5 s at 2 frames a
+    # second): decoded through for its reference frames, that group leaves
+    # gaps of 8.5 s, and a 1.78 shot of 4 s between them unseen. Decoded
+    # again frame by frame, the shot is seen.
+    f = Film()
+    f.wide(209).full(4).wide(187)
+    f.starts = [float(t) for t in range(0, 400, 2) if not 200 < t < 220]
+    enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-g", "1000",
+           "-keyint_min", "1000", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+           "-x264-params", "bframes=16:b-adapt=0:b-pyramid=none"]  # fmt: skip
+    m = measure(f.render(media / "sparse-refs.mkv", enc=enc), 400_000)
+    whole_by(m, (209, 213))
+    assert m.sampling["closed"]["runs"] >= 1, m.sampling
+
+
+@pytest.mark.parametrize("shot", [False, True])
+def test_a_long_group_and_a_long_last_group_of_a_package_are_decoded_frame_by_frame(
+    media: Path, shot: bool
+) -> None:
+    # A rung copied of a source with a keyframe every 2 s but none from 101 s
+    # to 108 s, and its last group of pictures 7 s long: its sync samples
+    # leave both unsampled. Decoded frame by frame, the area is told, and a
+    # 1.78 shot of 4 s in the long group is seen.
+    f = Film()
+    f.wide(102.5).full(4).wide(293.5) if shot else f.wide(400)
+    f.starts = [float(t) for t in sorted({*range(0, 101, 2), 101, *range(108, 393, 2), 393})]
+    enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-g", "1000",
+           "-keyint_min", "1000", "-sc_threshold", "0", "-pix_fmt", "yuv420p"]  # fmt: skip
+    name = f"long-gop{'-178' if shot else ''}"
+    src = f.render(media / f"{name}.mkv", enc=enc)
+    m = measure(package(src, media / f"pkg-{name}"), 400_000)
+    if shot:
+        whole_by(m, (102.5, 106.5))
+        return
+    near(m, T239)
+    s = m.sampling
+    assert s["mode"] == "package" and s["doubt"] == [] and s["maxGapS"] <= 2.9, m.reason
+    assert s["closed"]["runs"] == 2 and s["videoEndS"] == pytest.approx(399.5, abs=0.1)
 
 
 def test_a_run_of_long_groups_of_pictures_reads_on(media: Path, monkeypatch) -> None:
@@ -807,13 +909,15 @@ def test_a_package_is_sampled_by_its_keyframes(media: Path) -> None:
 
 def test_a_package_with_a_keyframe_every_6_s_cant_tell(media: Path) -> None:
     # An encoder's rung: an IDR every 6 s, none at a cut. A shot of 3 s
-    # between two of them has no sample: the measurement can't tell.
+    # between two of them has no sample: the measurement can't tell. Its
+    # samples are far apart all through, not in a few gaps: none is decoded
+    # again frame by frame.
     vf = "drawbox=x=284:y=6:w=26:h=10:color=white@0.9:t=fill"
     pkg = package(wide_film(media, "logo", 400, {}, vf=vf), media / "pkg-encoded", copy=False)
     m = measure(pkg, 400_000)
     assert m.area is None
     assert m.reason.startswith("can't tell: its samples are up to 6.0 s apart"), m.reason
-    assert m.sampling["doubt"] == ["gap"]
+    assert m.sampling["doubt"] == ["gap"] and "closed" not in m.sampling
 
 
 def test_a_short_package_is_decoded_through(media: Path) -> None:
@@ -841,7 +945,7 @@ def test_a_measurement_reports_what_it_measured_and_what_it_cost(media: Path) ->
     path = wide_film(media, "wide", 400, {})
     m = measure(path, 400_000)
     r = m.report()
-    assert r["method"] == "picture/4" and r["measuredOn"]["kind"] == "original"
+    assert r["method"] == "picture/5" and r["measuredOn"]["kind"] == "original"
     assert r["measuredOn"]["size"] == os.path.getsize(path)
     assert r["bytesRead"] > 0 and r["cpuSeconds"] >= 0 and r["sampling"]["stretches"] == 12
     assert r["decoder"].startswith("av ") and r["video"]["codec"] == "h264"

@@ -42,6 +42,23 @@ stretches, the rest) within READ_MB_PER_HOUR of the title
 keyframe every 6 s and none at a cut leaves its samples 6 s apart: the
 measurement says it can't tell (child.py).
 
+What the samples leave further apart than MAX_GAP_S is decoded again, frame
+by frame (_close()): the head of the title (before its first sample), its
+tail (after its last, to the end of the file), and up to CLOSE_MAX_GAPS gaps
+between, each at most CLOSE_MAX_SPAN_S of the title from its keyframe. Such a
+run decodes the reference frames only up to the gap (the frames it skips are
+none the gap's frames refer to), and every frame through it.
+
+The title's picture starts at its first frame decoded exactly: the file's
+first keyframe, read as it opens (_read_head()), or a frame before it that the
+decoder makes from a keyframe its container does not mark; the frames before
+lack their reference frames, which no decoder makes exactly and no player
+shows. It ends where its file says it does, or at its video's last frame
+when the file runs on past that to its end (its sound longer than its
+picture): the tail read to the end of the file tells, by every stream's
+packets. A file whose every stream stops short of the end it says is cut
+short, and its end stays the one it says.
+
 What the samples are is what was decoded: a seek that lands on another
 frame than the keyframe it sought is counted (missed), a frame sampled twice
 too (duplicates), and the gaps are those between the frames' own times.
@@ -52,7 +69,9 @@ from __future__ import annotations
 import bisect
 import io
 import itertools
+import math
 import os
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -93,6 +112,19 @@ THROUGH_READ_MAX = 512 << 20
 GOP_HOLD_MAX = 64 << 20
 # A package's keyframe passes before the stretches, and after them.
 COARSE, FINE = (16, 8), (4, 2, 1)
+# No two samples further apart than this, the title's start and end too:
+# else the measurement can't tell (child.py).
+MAX_GAP_S = 3.0
+# The gaps between samples decoded frame by frame: CLOSE_MAX_GAPS at most,
+# each at most CLOSE_MAX_SPAN_S of the title from the keyframe its run starts
+# at (a long group of pictures). A title with more is sampled far apart all
+# through (a package's rung with a keyframe every 6 s), and stays in doubt.
+CLOSE_MAX_GAPS = 4
+CLOSE_MAX_SPAN_S = 30.0
+# A run's reference frames only until a packet this close to the gap: the
+# frames reordered around its start are decoded too. A file without an index
+# is sought this far before the keyframe (its search reckons decoding times).
+SEEK_BACK_S = 1.0
 
 # sink(time, segs, counted) takes a sample, and answers True once the area
 # is decided (the measurement stops there).
@@ -117,7 +149,12 @@ class Sampling:
     find the bar black (calibration), the bytes it read to open the file
     and in all, the budget and whether it stopped there, whether it stopped
     early because the area was decided (stopped_early, at the time of the
-    sample that decided it), and the samples' own times."""
+    sample that decided it), and the samples' own times; where the title's
+    picture starts (video_start_s, its first frame decoded exactly) and ends
+    (video_end_s, its video's last frame, when the file runs on past it),
+    where the file's data ends as its tail was read (data_end_s), and the
+    runs that decoded its gaps frame by frame (closed: how many, their
+    frames, their bytes and their processor seconds)."""
 
     mode: str = ""
     duration_s: float = 0.0
@@ -137,30 +174,49 @@ class Sampling:
     stopped_at: float | None = None
     times: list[float] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    video_start_s: float | None = None
+    video_end_s: float | None = None
+    data_end_s: float | None = None
+    closed: int = 0
+    closed_frames: int = 0
+    closed_bytes: int = 0
+    closed_cpu_s: float = 0.0
 
     def fail(self, why: str) -> None:
         self.failed += 1
         if len(self.errors) < 5:
             self.errors.append(why[:200])
 
+    def start_s(self) -> float:
+        """Where the title's picture starts: its first frame decoded exactly,
+        else its video's start."""
+        return 0.0 if self.video_start_s is None else self.video_start_s
+
     def end_s(self) -> float:
-        """Where the title ends: its file's duration, or its last sample."""
-        return max(self.duration_s, max(self.times, default=0.0))
+        """Where the title ends: its video's last frame when the file runs
+        on past it, else its file's duration; its last sample when later."""
+        last = max(self.times, default=0.0)
+        if self.video_end_s is not None:
+            return max(self.video_end_s, last)
+        return max(self.duration_s, last)
+
+    def spans(self) -> list[tuple[float, float]]:
+        """The stretches of the title between its samples, its head (from
+        its start to its first sample) and its tail (from its last to its
+        end) too: (from, to)."""
+        if not self.times:
+            return []
+        t = sorted(set(self.times))
+        return [(min(self.start_s(), t[0]), t[0]), *itertools.pairwise(t), (t[-1], self.end_s())]
 
     def largest_gap(self) -> tuple[float, float] | None:
         """The longest stretch of the title without a sample, from its start
         to its end, and where it begins."""
-        if not self.times:
+        spans = self.spans()
+        if not spans:
             return None
-        t = sorted(set(self.times))
-        best = (t[0], 0.0)
-        for a, b in itertools.pairwise(t):
-            if b - a > best[0]:
-                best = (b - a, a)
-        end = self.end_s()
-        if end - t[-1] > best[0]:
-            best = (end - t[-1], t[-1])
-        return best
+        a, b = max(spans, key=lambda s: s[1] - s[0])
+        return (b - a, a)
 
     def max_gap(self) -> float | None:
         g = self.largest_gap()
@@ -255,6 +311,34 @@ def stretches(duration_s: float) -> list[tuple[float, float]]:
         a = max(0.0, (k + 0.5) * duration_s / STRETCHES - length / 2)
         out.append((a, min(duration_s, a + length)))
     return out
+
+
+def to_close(
+    sm: Sampling, key_before: Callable[[float], float | None]
+) -> list[tuple[str, float, float]]:
+    """The runs that decode a measurement's gaps of more than MAX_GAP_S
+    frame by frame, in their order: its tail (from its last sample to the
+    file's end), the gaps between its samples, its head (from where its
+    picture starts to its first sample); each (kind, from, to). None when a
+    gap between its samples can't be closed so: more than CLOSE_MAX_GAPS of
+    them, or one whose run from the keyframe at or before it (key_before)
+    would cover more than CLOSE_MAX_SPAN_S of the title."""
+    spans = sm.spans()
+    if not spans:
+        return []
+    head, *inner, tail = spans
+    inner = [(a, b) for a, b in inner if b - a > MAX_GAP_S]
+    if len(inner) > CLOSE_MAX_GAPS:
+        return []
+    for a, b in inner:
+        k = key_before(a)
+        if k is None or b - k > CLOSE_MAX_SPAN_S:
+            return []
+    runs = [("tail", tail[0], math.inf)] if tail[1] - tail[0] > MAX_GAP_S else []
+    runs += [("gap", a, b) for a, b in inner]
+    if head[1] - head[0] > MAX_GAP_S:
+        runs.append(("head", head[0], head[1]))
+    return runs
 
 
 def _max_gap(times: list[float], duration_s: float) -> float:
@@ -391,6 +475,8 @@ class _Source:
         self._calibration_keys: set[int] = set()
         self._done = False
         self._sized = False
+        # the frames the decoder gave the runs that decode gaps again
+        self._frames = 0
 
     def _spent(self) -> int:
         """The bytes read so far, besides opening the file."""
@@ -467,6 +553,38 @@ class _Source:
             self._done = sm.stopped_early = True
             sm.stopped_at = t
 
+    def _key_before(self, t: float) -> float | None:
+        """The time of the keyframe at or before t, as the source knows its
+        keyframes; None before the first."""
+        raise NotImplementedError
+
+    def _span(self, a: float, b: float, sink: Sink, tail: bool = False) -> None:
+        """Decode the title from the keyframe at or before a to b (tail: to
+        the end of the file), every frame from a, a sample each
+        TARGET_GAP_S."""
+        raise NotImplementedError
+
+    def _close(self, sink: Sink) -> None:
+        """Decode frame by frame what the samples leave more than MAX_GAP_S
+        apart (to_close()), unless the area is decided or the measurement is
+        in doubt for more than its gaps: its reads stopped, a seek decoded
+        another frame, a frame was decoded twice."""
+        sm = self.sampling
+        if self._done or sm.stopped or sm.missed or sm.duplicates:
+            return
+        runs = to_close(sm, self._key_before)
+        cpu, spent, frames = time.process_time(), self._spent(), self._frames
+        try:
+            for kind, a, b in runs:
+                if self._over():
+                    break
+                sm.closed += 1
+                self._span(a, b, sink, tail=kind == "tail")
+        finally:
+            sm.closed_frames += self._frames - frames
+            sm.closed_bytes += self._spent() - spent
+            sm.closed_cpu_s += time.process_time() - cpu
+
 
 # ------------------------------------------------------------- originals
 class Original(_Source):
@@ -519,6 +637,15 @@ class Original(_Source):
         self._catalog_s = duration_s
         self.sampling.bytes_open = self._io.bytes
         self._start = v.start_time or 0
+        # where the file starts, in seconds: what its duration is from
+        start = float(self._start * v.time_base)
+        self._file_start = start
+        if self._c.start_time is not None:
+            self._file_start = self._c.start_time / av.time_base
+        self._video_start = start
+        # the keyframes known (their times, and of an index their timestamps)
+        self._key_times: list[float] = []
+        self._keys: list[tuple[float, int]] = []
 
     def close(self) -> None:
         try:
@@ -540,8 +667,12 @@ class Original(_Source):
         """The video's keyframes, from its container's index; [] without one."""
         v = self._v
         try:
-            # Matroska reads its cues at the first seek
-            self._c.seek(self._start, stream=v, backward=True)
+            # Matroska reads its cues at the first seek; an MP4 whose first
+            # frame is no keyframe has none to land on before it
+            try:
+                self._c.seek(self._start, stream=v, backward=True)
+            except av.error.FFmpegError:
+                self._c.seek(self._start, stream=v, backward=True, any_frame=True)
         except av.error.FFmpegError:
             return []
         keys = {e.timestamp for e in (v.index_entries or []) if e.is_keyframe}
@@ -554,25 +685,203 @@ class Original(_Source):
         dur = max(sm.duration_s, self._catalog_s)
         size = self._io.size()
         sm.budget = original_budget(dur, size)
+        head = self._read_head()
         # the index as the container has it, before any seek of the
         # calibration's adds the keyframes it passes to it
         keys = self._index()
         times = [t for t, _ts in keys]
+        indexed = len(times) >= 2 and _max_gap(times, sm.duration_s) <= INDEX_GAP_MAX_S
+        if indexed:
+            self._keys, self._key_times = keys, list(times)
         if dur <= SHORT_S and size <= SEQUENTIAL_MAX_BYTES:
             sm.mode = "sequential"
             sm.planned = max(1, int(sm.duration_s / SEQUENTIAL_STEP_S))
-        elif len(times) >= 2 and _max_gap(times, sm.duration_s) <= INDEX_GAP_MAX_S:
+        elif indexed:
             sm.mode = "keyframes"
         else:
             sm.mode = "stream"
         self._calibrate(sm.duration_s or dur, sink)
+        for t, segs in head:
+            # frames before the first keyframe its container marks
+            if self._done or round(t * 1000) in self._seen:
+                continue
+            sm.attempted += 1
+            self._hand(t, segs, sink, True)
         if not self._done:
             if sm.mode == "keyframes":
                 self._indexed(keys, sink)
             else:
                 self._stream(sink, everything=sm.mode == "sequential")
+        self._close(sink)
         sm.bytes_read = self._io.bytes
         return sm
+
+    def _read_head(self) -> list[tuple[float, planes.Segs]]:
+        """Where the title's picture starts, read as the file opens (its
+        demuxer at its start): at its first video packet when that is a
+        keyframe; else the frames up to its first keyframe are decoded, every
+        one, and those the decoder makes exactly (from a keyframe the
+        container does not mark) are kept, one each SEQUENTIAL_STEP_S, to be
+        samples once the bar black is known. The picture starts at the first
+        of them, or at the first keyframe: the frames before it lack their
+        reference frames. Its first keyframe not within CLOSE_MAX_SPAN_S of
+        the title or THROUGH_READ_MAX of reads, the picture's start stays the
+        video's (or the first frame made exactly)."""
+        sm, v, c = self.sampling, self._v, self._c
+        cc = v.codec_context
+        kept: list[tuple[float, planes.Segs]] = []
+        keyed = False
+        cpu, spent, decoded = time.process_time(), self._spent(), 0
+        limit = self._io.bytes + THROUGH_READ_MAX
+
+        def take(frames: list[Any]) -> None:
+            nonlocal keyed
+            for frame in frames:
+                keyed = keyed or frame.key_frame
+                if frame.pts is None or not keyed or frame.is_corrupt or not self._admit(frame):
+                    continue
+                t = self._time(frame.pts)
+                if not kept or t - kept[-1][0] >= SEQUENTIAL_STEP_S:
+                    kept.append((t, planes.frame_segments(frame)))
+
+        try:
+            cc.skip_frame = "DEFAULT"
+            for pkt in c.demux(v):
+                stamp = pkt.pts if pkt.pts is not None else pkt.dts
+                first = bool(pkt.size) and pkt.is_keyframe and stamp is not None
+                late = stamp is not None and self._time(stamp) > CLOSE_MAX_SPAN_S
+                if first or late or not pkt.size or self._io.bytes > limit:
+                    try:
+                        if decoded:
+                            take(cc.decode(None))  # what the decoder holds yet
+                    except (av.error.FFmpegError, ValueError):
+                        pass
+                    if first:
+                        at = min([self._time(stamp)] + [t for t, _s in kept])
+                        sm.video_start_s = max(0.0, at)
+                    break
+                decoded += 1
+                try:
+                    take(cc.decode(pkt))
+                except (av.error.FFmpegError, ValueError):
+                    continue  # (its reference frames are not in the file)
+        except (av.error.FFmpegError, OSError, ValueError):
+            pass
+        finally:
+            cc.flush_buffers()
+        if kept and sm.video_start_s is None:
+            sm.video_start_s = kept[0][0]
+        if decoded:
+            # the head decoded frame by frame: a run of its own
+            sm.closed += 1
+            sm.closed_frames += decoded
+            sm.closed_bytes += self._spent() - spent
+            sm.closed_cpu_s += time.process_time() - cpu
+        return kept
+
+    def _key_before(self, t: float) -> float | None:
+        i = bisect.bisect_right(self._key_times, t + 1e-6) - 1
+        return self._key_times[i] if i >= 0 else None
+
+    def _target(self, i: int) -> int:
+        """The timestamp a seek to the index's keyframe i is made to: a seek
+        lands on the keyframe at or before its time as the container reckons
+        it, and an MP4's index holds decoding times while its seeks reckon
+        presentation times, so one to a keyframe's own entry lands on the
+        keyframe before it where frames are reordered. Halfway to the next
+        keyframe lands on this one."""
+        keys = self._keys
+        ts = keys[i][1]
+        if i + 1 < len(keys):
+            nxt = keys[i + 1][1]
+        else:
+            nxt = self._ts(max(self.sampling.duration_s, keys[i][0] + 1.0))
+        return ts + max(0, (nxt - ts) // 2)
+
+    def _span(self, a: float, b: float, sink: Sink, tail: bool = False) -> None:
+        """Decode from the keyframe at or before a to b: the reference frames
+        only until a packet within SEEK_BACK_S of a (none after refers to the
+        frames skipped), every frame from there, a sample each TARGET_GAP_S.
+        The tail (from the last sample, b infinite) reads to the end of the
+        file, every stream's packets for their times besides: the video's
+        last frame is where the title ends when the file's data runs on to
+        within MAX_GAP_S of the end it says (its sound longer), not when
+        every stream stops short of it (the file cut short)."""
+        sm, v, c = self.sampling, self._v, self._c
+        cc = v.codec_context
+        k = self._key_before(a)
+        if k is None:
+            return
+        if self._keys:
+            ts = self._target(bisect.bisect_right([t for t, _ts in self._keys], k + 1e-6) - 1)
+        else:
+            ts = self._ts(max(0.0, k - SEEK_BACK_S))
+        others = []
+        if tail:
+            others = [
+                s
+                for s in c.streams
+                if s is not v and not (s.disposition & av.stream.Disposition.attached_pic)
+            ]
+        for s in others:
+            s.discard = av.stream.Discard.default
+        taker = _Taker(self, sink, True)
+        keyed, eof = False, False
+        last: int | None = None  # the video's latest packet
+        data_end = -math.inf  # the latest end of any stream's packet, in seconds
+        try:
+            cc.flush_buffers()
+            cc.skip_frame = "NONREF"
+            c.seek(ts, stream=v, backward=True, any_frame=False)
+            stop = self._io.bytes + THROUGH_READ_MAX
+            for pkt in c.demux(*([] if tail else [v])):
+                stamp = pkt.pts if pkt.pts is not None else pkt.dts
+                if pkt.size and stamp is not None:
+                    end = (stamp + max(pkt.duration or 0, 0)) * pkt.time_base
+                    data_end = max(data_end, float(end))
+                if pkt.stream.index != v.index:
+                    continue  # (a flush packet's own index is none)
+                if pkt.size and stamp is not None:
+                    last = stamp if last is None else max(last, stamp)
+                    if self._time(stamp) >= a - SEEK_BACK_S:
+                        cc.skip_frame = "DEFAULT"
+                try:
+                    frames = cc.decode(pkt if pkt.size else None)
+                except (av.error.FFmpegError, ValueError) as e:
+                    sm.fail(f"a frame could not be decoded: {e}")
+                    continue
+                self._frames += len(frames)
+                done = False
+                for frame in frames:
+                    keyed = keyed or frame.key_frame
+                    if frame.pts is None or not keyed or frame.is_corrupt:
+                        continue
+                    t = self._time(frame.pts)
+                    if t >= b - 1e-6:
+                        done = True
+                        break
+                    if t + 1e-6 < a:
+                        continue
+                    sm.attempted += 1
+                    taker.frame(t, frame, TARGET_GAP_S)
+                if done:
+                    break
+                if not pkt.size:
+                    eof = True
+                    break
+                if self._io.bytes > stop or self._over():
+                    break
+        except (av.error.FFmpegError, OSError) as e:
+            sm.fail(f"the video could not be read through: {e}")
+        finally:
+            taker.close_at(b, TARGET_GAP_S)
+            cc.flush_buffers()
+            for s in others:
+                s.discard = av.stream.Discard.all
+        if tail and eof and last is not None:
+            sm.data_end_s = data_end - self._video_start
+            if data_end >= self._file_start + sm.duration_s - MAX_GAP_S:
+                sm.video_end_s = self._time(last)
 
     def _calibrate(self, dur: float, sink: Sink) -> None:
         seen = []
@@ -633,17 +942,7 @@ class Original(_Source):
         end = sm.duration_s
         times = [t for t, _ts in keys]
         picked = thin(times, MIN_KEY_SPACING_S)
-
-        def target(k: int) -> int:
-            # A seek lands on the keyframe at or before its time as the
-            # container reckons it: an MP4's index holds decoding times and
-            # its seeks reckon presentation times, so one to a keyframe's own
-            # entry lands on the keyframe before it where frames are
-            # reordered. Halfway to the next keyframe lands on this one.
-            ts = keys[k][1]
-            nxt = keys[k + 1][1] if k + 1 < len(keys) else self._ts(max(end, keys[k][0] + 1.0))
-            return ts + max(0, (nxt - ts) // 2)
-
+        target = self._target
         plan: list[tuple[float, int, str, int, float]] = []
         for i, k in enumerate(picked):
             t = keys[k][0]
@@ -773,17 +1072,18 @@ class Original(_Source):
                     last_key[0] = t0
             gop, held = [], 0
 
-        try:
-            # back to the file's start after the calibration's seeks: to a
-            # time before any stream's, as a transport stream's search lands
-            # past its first keyframe for its video's own start (that
-            # keyframe's decoding time is before it)
-            c.seek(0)
-        except av.error.FFmpegError:
+        # back to the file's start after the calibration's seeks: to a time
+        # before any stream's, as a transport stream's search lands past its
+        # first keyframe for its video's own start (that keyframe's decoding
+        # time is before it); else to the video's start, to its first frame
+        # where that is no keyframe (an MP4 has none before it to land on)
+        video: dict[str, Any] = {"stream": v}
+        for at, kw in ((0, {}), (self._start, video), (self._start, {**video, "any_frame": True})):
             try:
-                c.seek(self._start, stream=v, backward=True)
+                c.seek(at, backward=True, **kw)
+                break
             except av.error.FFmpegError:
-                pass
+                continue
         try:
             for pkt in c.demux(v):
                 if not pkt.size:
@@ -796,6 +1096,8 @@ class Original(_Source):
                         finish(t)
                         t0 = t
                         gop, held = [pkt], pkt.size
+                        if not self._keys:
+                            bisect.insort(self._key_times, t)
                     continue
                 if live is not None:
                     self._decode_gop([pkt], live, step, windows, flush=False)
@@ -976,6 +1278,11 @@ class Package(_Source):
             size = sum(os.path.getsize(s.path) for s in self._segments)
             sequential = dur <= SHORT_S and size <= SEQUENTIAL_MAX_BYTES
             sm.mode = "package-sequential" if sequential else "package"
+            # its picture starts at its first sample when that is a keyframe
+            # (a packager drops the frames before a source's first keyframe)
+            first = min(self._list(self._segments[:1], False), key=lambda s: s.dts, default=None)
+            if first is not None and first.sync:
+                sm.video_start_s = first.pts / ts
             self._calibrate(sink)
             if self._done:
                 return sm
@@ -986,8 +1293,9 @@ class Package(_Source):
                 samples = self._list(self._segments, False)
                 self._decode(samples, 0.0, float("inf"), SEQUENTIAL_STEP_S, taker)
                 taker.close_at(sm.duration_s, SEQUENTIAL_STEP_S)
-                return sm
-            self._keyframes_and_stretches(sink, dur)
+            else:
+                self._keyframes_and_stretches(sink, dur)
+            self._close(sink)
         except (fmp4.Unreadable, OSError) as e:
             raise Unreadable(str(e)) from e
         finally:
@@ -1052,8 +1360,27 @@ class Package(_Source):
         return None
 
     def _stretch(self, a: float, b: float, sink: Sink) -> None:
-        # the segments from the one holding the last keyframe at or before a
-        k = bisect.bisect_right(self._times, a) - 1
+        self._through(a, b, STRETCH_STEP_S, _Taker(self, sink, False))
+
+    def _key_before(self, t: float) -> float | None:
+        i = bisect.bisect_right(self._times, t + 1e-6) - 1
+        return self._times[i] if i >= 0 else None
+
+    def _span(self, a: float, b: float, sink: Sink, tail: bool = False) -> None:
+        """Decode from the sync sample at or before a to b (tail: to the
+        rendition's last sample, where its video ends), every frame from a
+        (the reference frames only before), a sample each TARGET_GAP_S."""
+        last = self._through(a, b, TARGET_GAP_S, _Taker(self, sink, True), every_from=a)
+        if tail and last is not None:
+            self.sampling.video_end_s = last
+
+    def _through(
+        self, a: float, b: float, step: float, taker: _Taker, every_from: float | None = None
+    ) -> float | None:
+        """Decode the segments from the one holding the last sync sample at
+        or before a to b, handing the frames from a to b to taker; the time
+        of the last sample of those segments."""
+        k = bisect.bisect_right(self._times, a + 1e-6) - 1
         start = self._times[k] if k >= 0 else 0.0
         segs = [s for s in self._segments if s.start + s.duration > start - 1e-6 and s.start <= b]
         ts = self._init.timescale
@@ -1062,15 +1389,22 @@ class Package(_Source):
             (i for i, s in enumerate(samples) if s.sync and s.pts / ts >= start - 1e-6), None
         )
         if first is None:
-            return
-        taker = _Taker(self, sink, False)
-        self._decode(samples[first:], a, b, STRETCH_STEP_S, taker)
-        taker.close_at(b, STRETCH_STEP_S)
+            return None
+        self._decode(samples[first:], a, b, step, taker, every_from)
+        taker.close_at(b, step)
+        return max(s.pts for s in samples) / ts
 
     def _decode(
-        self, samples: list[fmp4.Sample], a: float, b: float, step: float, taker: _Taker
+        self,
+        samples: list[fmp4.Sample],
+        a: float,
+        b: float,
+        step: float,
+        taker: _Taker,
+        every_from: float | None = None,
     ) -> None:
-        """Decode samples in their decode order, the reference frames, handing
+        """Decode samples in their decode order, the reference frames (and
+        every frame from a sample within SEEK_BACK_S of every_from), handing
         those from a to b to taker."""
         sm, cc = self.sampling, self._cc
         ts = self._init.timescale
@@ -1079,6 +1413,8 @@ class Package(_Source):
             for s in samples:
                 if s.dts / ts > b + 2.0 or self._done:
                     break
+                if every_from is not None and s.pts / ts >= every_from - SEEK_BACK_S:
+                    cc.skip_frame = "DEFAULT"
                 try:
                     pkt = av.Packet(self._read(s))
                     pkt.pts, pkt.dts = s.pts, s.dts
@@ -1092,6 +1428,7 @@ class Package(_Source):
             cc.flush_buffers()
             cc.skip_frame = "NONREF"
             for frame in frames():
+                self._frames += 1
                 keyed = keyed or frame.key_frame
                 if not keyed or frame.is_corrupt or frame.pts is None:
                     continue

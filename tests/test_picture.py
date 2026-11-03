@@ -6,6 +6,7 @@ get right, as small videos ffmpeg makes, are in test_picture_cases.py."""
 from __future__ import annotations
 
 import itertools
+import math
 import struct
 import sys
 import time
@@ -438,6 +439,51 @@ def test_the_largest_gap_is_between_the_frames_decoded_and_the_ends() -> None:
     assert sources.Sampling(duration_s=10.0, times=[1.0, 3.0]).largest_gap() == (7.0, 3.0)
 
 
+def test_the_gaps_run_from_the_first_frame_decoded_exactly_to_the_videos_last() -> None:
+    # The picture starts at 7 s (the frames before lack their keyframe) and
+    # ends at 399.5 s, its sound running on to 405 s.
+    times = [7.0 + 2.5 * k for k in range(158)]
+    sm = sources.Sampling(duration_s=405.0, times=times)
+    assert sm.largest_gap() == (7.0, 0.0)
+    sm.video_start_s = 7.0
+    assert sm.largest_gap() == pytest.approx((5.5, 399.5))
+    sm.video_end_s = 399.6
+    assert sm.max_gap() == pytest.approx(2.5)
+    # a frame before the start (reordered before the first keyframe) is one
+    sm.times.insert(0, 6.9)
+    assert sm.spans()[0] == (6.9, 6.9)
+
+
+def test_the_gaps_left_are_decoded_frame_by_frame_up_to_the_cap() -> None:
+    keys = [10.0 * k for k in range(41)]
+
+    def key_before(t: float) -> float | None:
+        before = [k for k in keys if k <= t + 1e-6]
+        return before[-1] if before else None
+
+    def runs(times: list[float]) -> list[tuple[str, float, float]]:
+        return sources.to_close(sources.Sampling(duration_s=400.0, times=times), key_before)
+
+    dense = [2.5 * k for k in range(161)]
+    assert runs(dense) == []
+    # the tail first (it may tell the title ends earlier), then the gaps
+    # between, the head last
+    times = [t for t in dense if not 101 < t < 108 and 7 <= t <= 390]
+    assert runs(times) == [("tail", 390.0, math.inf), ("gap", 100.0, 110.0), ("head", 0.0, 7.5)]
+    # more gaps than CLOSE_MAX_GAPS, or one whose run from its keyframe is
+    # longer than CLOSE_MAX_SPAN_S, and none are decoded: it stays in doubt
+    cuts = [80 * k + 11 for k in range(sources.CLOSE_MAX_GAPS + 1)]
+    assert runs([t for t in dense if not any(a < t < a + 5 for a in cuts)]) == []
+    assert runs([t for t in dense if not any(a < t < a + 5 for a in cuts[1:])]) == [
+        ("gap", 90.0, 97.5), ("gap", 170.0, 177.5), ("gap", 250.0, 257.5), ("gap", 330.0, 337.5),
+    ]  # fmt: skip
+    assert runs([t for t in dense if not 150 < t < 175]) == [("gap", 150.0, 175.0)]
+    assert runs([t for t in dense if not 150 < t < 182]) == []
+    nothing_known = sources.to_close(sources.Sampling(duration_s=400.0, times=[50.0, 60.0]),
+                                     lambda t: None)  # fmt: skip
+    assert nothing_known == []
+
+
 def test_a_measurement_in_doubt_says_why() -> None:
     dense = [k * 2.5 for k in range(41)]
     assert child.doubts(sources.Sampling(duration_s=100.0, times=dense)) == ([], [])
@@ -625,7 +671,7 @@ def test_the_process_says_what_it_could_not_read(tmp_path: Path) -> None:
     m = picture.measure(str(bad), 60_000)
     assert m.area is None and m.error and m.error.startswith("the file can't be opened")
     assert m.cpu_seconds > 0 and m.max_rss_bytes > 0
-    assert m.report()["method"] == picture.METHOD == "picture/4"
+    assert m.report()["method"] == picture.METHOD == "picture/5"
 
 
 def test_the_decoder_is_named(tmp_path: Path) -> None:
