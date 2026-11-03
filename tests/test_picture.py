@@ -1,551 +1,458 @@
-"""The picture-area measurement (pipelines/picture.py).
-
-The rules are held on frames drawn here and reduced as ffmpeg reduces them
-(segment means per row, then per column); the sampling, the package's
-segments and ffmpeg's reduction on short videos ffmpeg makes, one for each
-case the measurement has to get right. Those are skipped without an ffmpeg
-that encodes H.264."""
+"""The picture-area measurement (pipelines/picture): its rules on frames
+drawn here as Y, U and V planes, the sampling's plans, a package's playlist
+and fragments, and the measurement's own process. The cases a title has to
+get right, as small videos ffmpeg makes, are in test_picture_cases.py."""
 
 from __future__ import annotations
 
-import shutil
+import itertools
 import struct
-import subprocess
+import sys
+import time
+import tracemalloc
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from analyzer.pipelines import picture
-from analyzer.pipelines.picture import Box, decide
+from analyzer.pipelines.picture import Box, child, fmp4, planes, rules, sources
 
-BLACK = 16
+W, H = 320, 180
+# a 2.39:1 picture letterboxed in this 16:9 frame
+TOP, PIC = 24, 132
+LETTERBOX = Box(0, TOP, W, PIC)
+FULL = Box(0, 0, W, H)
 
 
 # ------------------------------------------------------------ drawn frames
-def canvas(w: int, h: int, level: int = BLACK) -> list[bytearray]:
-    return [bytearray([level]) * w for _ in range(h)]
+def yuv(
+    *,
+    top: int = TOP,
+    height: int = PIC,
+    left: int = 0,
+    width: int = W,
+    black: float = 16,
+    level: float | None = None,
+    seed: int = 0,
+    chroma: tuple[float, float] | None = None,
+    noise: float = 0.0,
+    marks: tuple[tuple[int, int, int, int, float], ...] = (),
+    fill: tuple[float, float, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The Y, U and V planes (4:2:0, 8 bits) of a picture over left, top,
+    width, height, in bars at black: a texture of 40 to 219 (a flat level),
+    its chroma neutral or (u, v); grain of noise levels over everything;
+    marks (x, y, w, h, level) drawn on top; fill (y, u, v) the whole frame
+    at one colour first."""
+    rng = np.random.default_rng(seed)
+    y = np.full((H, W), black, np.float64)
+    u = np.full((H // 2, W // 2), 128.0)
+    v = np.full((H // 2, W // 2), 128.0)
+    if fill is not None:
+        y[:], u[:], v[:] = fill
+    if height and width:
+        if level is None:
+            rows, cols = np.arange(height)[:, None], np.arange(width)[None, :]
+            y[top : top + height, left : left + width] = (
+                40 + (rows * 13 + cols * 7 + seed * 31) % 180
+            )
+        else:
+            y[top : top + height, left : left + width] = level
+        if chroma is not None:
+            cs = np.s_[top // 2 : (top + height) // 2, left // 2 : (left + width) // 2]
+            u[cs], v[cs] = chroma
+    for x, yy, w, h, lv in marks:
+        y[yy : yy + h, x : x + w] = lv
+    if noise:
+        y += rng.normal(0, noise, y.shape)
+        u += rng.normal(0, noise / 2, u.shape)
+        v += rng.normal(0, noise / 2, v.shape)
+    return tuple(np.clip(np.rint(p), 0, 255).astype(np.uint8) for p in (y, u, v))
 
 
-def paint(
-    img: list[bytearray], x: int, y: int, w: int, h: int, seed: int = 0, dim: int = 0
-) -> None:
-    """A textured picture over x, y, w, h: values 40..219 (less dim)."""
-    for r in range(y, y + h):
-        row = img[r]
-        for c in range(x, x + w):
-            row[c] = max(BLACK, 40 + (c * 7 + r * 13 + seed * 31) % 180 - dim)
+def reduced(**kw) -> planes.Reduced:
+    return planes.reduce_planes(*yuv(**kw), 8)
 
 
-def fill(img: list[bytearray], x: int, y: int, w: int, h: int, level: int) -> None:
-    for r in range(y, y + h):
-        img[r][x : x + w] = bytes([level]) * w
+def decide(*samples: planes.Reduced | tuple[planes.Reduced, bool]) -> rules.Decision:
+    acc = rules.Accumulator(W, H)
+    for i, s in enumerate(samples):
+        r, counted = s if isinstance(s, tuple) else (s, True)
+        acc.add(r, float(i), counted)
+    return acc.decide()
 
 
-def reduce(img: list[bytearray], k: int = picture.SEGMENTS) -> bytes:
-    """img reduced as ffmpeg's area scale reduces it: k means per row, then
-    k per column."""
-    h, w = len(img), len(img[0])
-    out = bytearray()
-    for row in img:
-        for j in range(k):
-            a, b = j * w // k, (j + 1) * w // k
-            out.append(round(sum(row[a:b]) / (b - a)))
-    for col in zip(*img, strict=True):
-        for j in range(k):
-            a, b = j * h // k, (j + 1) * h // k
-            out.append(round(sum(col[a:b]) / (b - a)))
-    return bytes(out)
-
-
-W, H = 320, 180
-
-
-def letterboxed(n: int = 30, top: int = 22, height: int = 134, **kw) -> list[bytes]:
-    frames = []
-    for i in range(n):
-        img = canvas(W, H)
-        paint(img, 0, top, W, height, seed=i, **kw)
-        frames.append(reduce(img))
-    return frames
+def letterboxed(n: int = 40, **kw) -> list[planes.Reduced]:
+    return [reduced(seed=i, **kw) for i in range(n)]
 
 
 def test_a_letterbox_is_its_picture() -> None:
-    d = decide(letterboxed(), W, H)
-    assert d.area == Box(0, 22, 320, 134)
-    assert d.sides["top"]["bar"] == 22 and d.sides["bottom"]["bar"] == 24
+    d = decide(*letterboxed())
+    assert d.area == LETTERBOX
+    assert d.sides["top"]["bar"] == TOP and d.sides["bottom"]["bar"] == H - TOP - PIC
 
 
 def test_a_full_frame_is_the_frame() -> None:
-    frames = []
-    for i in range(30):
-        img = canvas(W, H)
-        paint(img, 0, 0, W, H, seed=i)
-        frames.append(reduce(img))
-    d = decide(frames, W, H)
-    assert d.area == Box(0, 0, W, H)
+    d = decide(*letterboxed(top=0, height=H))
+    assert d.area == FULL
+    assert d.sides["top"]["note"] == "the frame's edge is never black"
 
 
-def test_dark_and_black_frames_never_shrink_it() -> None:
-    # A third of the frames black (a fade), a third so dark that no row of
-    # theirs holds picture: the bright third alone sets the edges.
-    frames = letterboxed(10)
-    frames += [reduce(canvas(W, H)) for _ in range(10)]
-    frames += letterboxed(10, dim=200)
-    d = decide(frames, W, H)
-    assert d.area == Box(0, 22, 320, 134)
+def test_black_dark_and_faded_frames_add_nothing() -> None:
+    black = [reduced(height=0, seed=i) for i in range(10)]
+    grey = [reduced(height=0, fill=(30, 128, 128), seed=i) for i in range(10)]
+    dark = [reduced(level=24, seed=i) for i in range(10)]
+    assert decide(*letterboxed(), *black, *grey, *dark).area == LETTERBOX
 
 
-def test_a_wider_scene_widens_it() -> None:
-    # 2.39 throughout, 1.85 in some of the frames: the union.
-    frames = letterboxed(24) + letterboxed(6, top=4, height=172)
-    d = decide(frames, W, H)
-    assert d.area == Box(0, 4, 320, 172)
+def test_a_wider_shot_few_samples_show_keeps_the_axis_whole() -> None:
+    # A 1.78 shot of a few seconds in a 2.39 film, sampled twice: the
+    # picture is the union, and reaches the frame's edge.
+    d = decide(*letterboxed(), *letterboxed(2, top=0, height=H))
+    assert d.area == FULL
+    assert d.sides["top"]["note"] == "the picture reaches the frame's edge"
+    # A 1.85 shot sampled twice: a side whose edge few samples show further
+    # out than most show theirs keeps the full frame (more of it may be in
+    # what was not sampled).
+    d = decide(*letterboxed(), *letterboxed(2, top=8, height=164))
+    assert d.area == FULL
+    assert "a picture 16 lines beyond the edge 40 show" in d.sides["top"]["note"]
 
 
-def test_an_edge_few_frames_show_keeps_the_frame_whole() -> None:
-    # One frame of 29 reaches further out: it may be a scene the samples
-    # saw too little of, so the side keeps the full frame.
-    frames = letterboxed(29) + letterboxed(1, top=4, height=172)
-    d = decide(frames, W, H)
-    assert d.area == Box(0, 0, W, H)
-    assert "needed" in d.sides["top"]["note"]
+def test_a_wider_shot_many_samples_show_is_the_area() -> None:
+    d = decide(*letterboxed(), *letterboxed(8, top=8, height=164))
+    assert d.area == Box(0, 8, W, 164)
 
 
-def test_noise_on_single_lines_of_a_bar_is_no_picture() -> None:
-    frames = []
-    for i in range(30):
-        img = canvas(W, H)
-        paint(img, 0, 22, W, 134, seed=i)
-        img[3 + i % 15][40:80] = bytes([BLACK + 60]) * 40  # a bright line, never two at once
-        frames.append(reduce(img))
-    assert decide(frames, W, H).area == Box(0, 22, 320, 134)
+def test_what_few_samples_show_near_the_edge_widens_it() -> None:
+    # Ringing at a bright edge, a blocky frame: a few lines out of the bar
+    # in one sample widen the area to take them in.
+    ringing = reduced(seed=99, marks=((0, 18, W, 6, 22), (0, 156, W, 6, 22)))
+    d = decide(*letterboxed(), ringing)
+    assert d.area == Box(0, 18, W, 144)
+    assert "widened by" in d.sides["top"]["note"] and "widened by" in d.sides["bottom"]["note"]
 
 
-def test_a_subtitle_in_a_bar_keeps_that_side_whole() -> None:
-    frames = letterboxed(26)
-    for i in range(4):  # a subtitle in the bottom bar, in 4 frames of 30
-        img = canvas(W, H)
-        paint(img, 0, 22, W, 134, seed=i)
-        for g in range(10):
-            fill(img, 100 + g * 12, 164, 8, 10, 235)
-        frames.append(reduce(img))
-    d = decide(frames, W, H)
-    assert d.area == Box(0, 22, 320, 158)
-    assert d.sides["bottom"]["note"].startswith("the bar is not black")
-    assert d.sides["bottom"]["seen"]
+def test_a_night_sky_a_few_levels_above_black_is_picture() -> None:
+    # A night film: the sky of its picture four levels above the bars'
+    # black, a bright skyline low in the frame, never a brighter sky.
+    night = [reduced(level=20, seed=i, marks=((0, 110, W, 46, 160),)) for i in range(40)]
+    assert decide(*night).area == LETTERBOX
 
 
-def test_a_subtitle_over_a_black_frame_counts_too() -> None:
-    frames = letterboxed(29)
-    img = canvas(W, H)
-    for g in range(10):
-        fill(img, 100 + g * 12, 164, 8, 10, 235)
-    frames.append(reduce(img))
-    assert decide(frames, W, H).area == Box(0, 22, 320, 158)
+def test_a_line_within_two_levels_of_black_is_bar() -> None:
+    # What is within LEVEL of the bars' black in every sample is black:
+    # nobody sees it.
+    dark = ((0, 24, W, 36, 17), (0, 120, W, 36, 17))
+    assert decide(*letterboxed(marks=dark)).area == Box(0, 60, W, 60)
+    # Lopsided, as a picture dark at its top only would make it: the axis
+    # is kept whole.
+    sky = [reduced(level=17, seed=i, marks=((0, 110, W, 46, 160),)) for i in range(40)]
+    assert decide(*sky).area == FULL
 
 
-def test_a_logo_in_a_bar_is_left_out() -> None:
-    frames = []
-    for i in range(30):
-        img = canvas(W, H)
-        paint(img, 0, 22, W, 134, seed=i)
-        fill(img, 290, 6, 24, 11, 150)  # in every frame, a quarter of the width at most
-        frames.append(reduce(img))
-    assert decide(frames, W, H).area == Box(0, 22, 320, 134)
+def test_a_deep_blue_open_matte_is_picture_by_its_chroma() -> None:
+    # A shot whose extra rows are a deep blue sea (RGB 0, 0, 100 in BT.709:
+    # Y 22, U 172, V 124): its chroma is what tells it from the bars, read
+    # from the U and V planes themselves. Even at a luma one level from
+    # black.
+    for luma in (22, 17):
+        blue = [
+            reduced(top=0, height=H, seed=i, fill=(luma, 172, 124), marks=((0, TOP, W, PIC, 120),))
+            for i in range(8)
+        ]
+        assert decide(*letterboxed(), *blue).area == FULL, luma
 
 
-def test_a_band_across_a_bar_is_no_logo() -> None:
-    # A band across the bar in every frame (a ticker) is too wide for a
-    # logo: it is picture, and the area takes it in.
-    frames = []
-    for i in range(30):
-        img = canvas(W, H)
-        paint(img, 0, 22, W, 134, seed=i)
-        fill(img, 20, 6, 280, 8, 150)
-        frames.append(reduce(img))
-    assert decide(frames, W, H).area == Box(0, 6, 320, 150)
+def test_ten_bit_planes_read_as_eight() -> None:
+    acc = rules.Accumulator(W, H)
+    for i in range(40):
+        y, u, v = (p.astype(np.uint16) * 4 for p in yuv(seed=i))
+        acc.add(planes.reduce_planes(y, u, v, 10), float(i))
+    assert acc.decide().area == LETTERBOX
 
 
-def test_a_dim_band_in_a_bar_is_no_bar() -> None:
-    # Dark picture, not black, where the bar would be (a dim scene of a
-    # wider frame): the side keeps the full frame rather than cut it.
-    frames = letterboxed(28)
-    for i in range(2):
-        img = canvas(W, H)
-        paint(img, 0, 22, W, 134, seed=i)
-        fill(img, 0, 2, W, 18, BLACK + 12)
-        frames.append(reduce(img))
-    assert decide(frames, W, H).area.y == 0
+def test_grain_in_the_bars_is_no_picture() -> None:
+    assert decide(*letterboxed(noise=1.5)).area == LETTERBOX
 
 
-def test_ringing_at_an_edge_widens_it() -> None:
-    frames = []
-    for i in range(30):
-        img = canvas(W, H)
-        paint(img, 0, 22, W, 134, seed=i)
-        fill(img, 0, 21, W, 1, BLACK + 9)  # one dim line right outside the edge
-        frames.append(reduce(img))
-    d = decide(frames, W, H)
-    assert d.area == Box(0, 20, 320, 136)  # line 21 taken in, rounded to even
-    assert "widened" in d.sides["top"]["note"]
+def test_a_static_logo_in_a_corner_of_a_bar_is_left_out() -> None:
+    logo = ((280, 6, 28, 10, 230),)
+    d = decide(*letterboxed(marks=logo))
+    assert d.area == LETTERBOX
+    assert d.sides["top"]["logo"]["segments"] == [28, 31] and "logo" in d.sides["top"]["note"]
 
 
-def test_pillarbox_and_windowbox() -> None:
-    def framed(x: int, y: int, w: int, h: int) -> list[bytes]:
-        out = []
-        for i in range(30):
-            img = canvas(W, H)
-            paint(img, x, y, w, h, seed=i)
-            out.append(reduce(img))
-        return out
+def test_a_mark_in_the_middle_of_a_bar_is_no_logo() -> None:
+    d = decide(*letterboxed(marks=((150, 6, 28, 10, 230),)))
+    assert d.area == FULL
 
-    assert decide(framed(40, 0, 240, 180), W, H).area == Box(40, 0, 240, 180)
-    assert decide(framed(40, 40, 240, 100), W, H).area == Box(40, 40, 240, 100)
-    # A wide picture in a narrow window: half its columns' segments lie in
-    # the bars, which the rows' extent leaves out.
-    assert decide(framed(40, 50, 240, 80), W, H).area == Box(40, 50, 240, 80)
+
+def test_a_mark_in_fewer_than_half_the_samples_is_no_logo() -> None:
+    logo = ((280, 6, 28, 10, 230),)
+    d = decide(*letterboxed(16, marks=logo), *letterboxed(24))
+    assert d.area == FULL
+
+
+def test_a_corner_with_more_than_its_mark_is_no_logo() -> None:
+    logo = ((280, 6, 28, 10, 230),)
+    other = ((260, 2, 8, 4, 230),)
+    d = decide(*letterboxed(36, marks=logo), *letterboxed(4, marks=logo + other))
+    assert d.area == FULL
+
+
+def test_subtitles_in_a_bar_keep_the_axis_whole() -> None:
+    glyphs = tuple((120 + 12 * g, 162, 8, 10, 235) for g in range(8))
+    d = decide(*letterboxed(24, marks=glyphs), *letterboxed(16))
+    assert d.area == FULL
+    assert "the axis kept whole" in d.sides["bottom"]["note"]
+
+
+def test_subtitles_only_a_stretch_shows_keep_the_axis_whole() -> None:
+    # The samples of a stretch decoded through widen the union, and are no
+    # support of an edge: a subtitle between keyframes keeps the axis whole.
+    glyphs = tuple((120 + 12 * g, 162, 8, 10, 235) for g in range(8))
+    stretch = [(r, False) for r in letterboxed(8, marks=glyphs)]
+    assert decide(*letterboxed(), *stretch).area == FULL
+
+
+def test_bars_of_another_height_keep_the_axis_whole() -> None:
+    assert decide(*letterboxed(top=24, height=116)).area == FULL
+    # a row or two is ringing, an encoder's rounding: within SYMMETRY
+    assert decide(*letterboxed(top=24, height=130)).area == Box(0, 24, W, 130)
+
+
+def test_a_bar_on_one_side_only_keeps_the_axis_whole() -> None:
+    d = decide(*letterboxed(top=24, height=H - 24))
+    assert d.area == FULL
+    assert d.sides["top"]["note"] == "a bar on one side only: the axis kept whole"
+
+
+def test_a_pillarbox_and_a_windowbox() -> None:
+    assert decide(*letterboxed(top=0, height=H, left=40, width=240)).area == Box(40, 0, 240, H)
+    assert decide(*letterboxed(top=18, height=144, left=64, width=192)).area == Box(
+        64, 18, 192, 144
+    )
 
 
 def test_edges_round_outwards_to_even_pixels() -> None:
-    assert decide(letterboxed(top=23, height=133), W, H).area == Box(0, 22, 320, 134)
+    assert decide(*letterboxed(top=23, height=133)).area == Box(0, 22, W, 134)
 
 
-def test_too_few_frames_with_a_picture_say_so() -> None:
-    frames = letterboxed(3) + [reduce(canvas(W, H)) for _ in range(27)]
-    d = decide(frames, W, H)
-    assert d.area is None and d.reason.startswith("too few frames")
+def test_too_few_samples_with_a_picture_say_so() -> None:
+    d = decide(*letterboxed(3), *[reduced(height=0, seed=i) for i in range(30)])
+    assert d.area is None and d.reason.startswith("too few samples show a picture")
 
 
-def test_edges_that_are_never_black_have_no_bars() -> None:
-    frames = [reduce(canvas(W, H, level=90)) for _ in range(30)]
-    assert decide(frames, W, H).area == Box(0, 0, W, H)
+def test_an_edge_that_is_never_black_has_no_bar() -> None:
+    d = decide(*letterboxed(black=60))
+    assert d.area == FULL and d.sides["top"]["note"] == "the frame's edge is never black"
 
 
-def test_sample_times_spread_over_the_title() -> None:
-    assert len(picture.sample_times(3600)) == 360
-    assert len(picture.sample_times(60)) == picture.MIN_SAMPLES
-    assert len(picture.sample_times(10 * 3600)) == picture.MAX_SAMPLES
-    ts = picture.sample_times(100, 10)
-    assert ts[0] > 0 and ts[-1] < 100
-    assert picture.sample_times(0) == []
+def test_the_counts_take_the_same_memory_for_any_number_of_samples() -> None:
+    big_w, big_h = 3840, 2160
+    y = np.full((big_h, big_w), 16, np.uint16) * 4
+    y[276:1884] = 400
+    u = np.full((big_h // 2, big_w // 2), 512, np.uint16)
+    r = planes.reduce_planes(y, u, u.copy(), 10)
+    acc = rules.Accumulator(big_w, big_h)
+    acc.add(r, 0.0)
+    tracemalloc.start()
+    for i in range(2000):
+        acc.add(r, float(i))
+    _cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 4 << 20
+    assert acc.decide().area == Box(0, 276, big_w, 1608)
 
 
-# --------------------------------------------------------------- playlists
+# ----------------------------------------------------------------- sampling
+def test_keyframes_are_picked_no_further_apart_than_the_gap() -> None:
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 9.0, 9.4, 30.0]
+    picks = sources.cover(times, 2.9)
+    # from each pick the latest within the gap, else the next one there is
+    assert [times[i] for i in picks] == [0.0, 2.5, 3.0, 9.0, 9.4, 30.0]
+    every = [k * 0.5 for k in range(100)]
+    got = [every[i] for i in sources.cover(every, 2.9)]
+    assert max(b - a for a, b in itertools.pairwise(got)) == 2.5
+
+
+def test_the_picks_go_coarse_to_fine_each_pass_in_order() -> None:
+    picks = list(range(40))
+    done: set[int] = set()
+    got = list(sources.passes(picks, (16, 8, 4), done))
+    assert got == [[0, 16, 32], [8, 24], [4, 12, 20, 28, 36]]
+    assert [len(p) for p in sources.passes(picks, (2, 1), done)] == [10, 20]
+
+
+def test_the_stretches_spread_over_the_title() -> None:
+    s = sources.stretches(7200)
+    assert len(s) == sources.STRETCHES
+    assert all(abs((b - a) - 12.0) < 1e-9 for a, b in s)
+    assert s[0][0] == pytest.approx(300 - 6) and s[-1][1] == pytest.approx(6900 + 6)
+    assert all(b - a == sources.STRETCH_MIN_S for a, b in sources.stretches(600))
+
+
+def test_the_budget_follows_the_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert sources.budget_bytes(7200) == 2 * sources.READ_MB_PER_HOUR << 20
+    assert sources.budget_bytes(60) == sources.READ_MIN_MB << 20
+    monkeypatch.setenv("PICTURE_READ_MB_PER_HOUR", "256")
+    assert sources.budget_bytes(7200) == 512 << 20
+
+
+# ------------------------------------------------------------------ package
 def test_a_playlist_names_its_segments_in_its_folder(tmp_path: Path) -> None:
     (tmp_path / "playlist.m3u8").write_text(
-        '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:6.0,\nseg-00001.m4s\n#EXTINF:5.5,\nseg-00002.m4s\n'
-        "#EXT-X-ENDLIST\n"
+        '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:6.000,\nseg-00000.m4s\n'
+        "#EXTINF:4.500,\nseg-00001.m4s\n#EXT-X-ENDLIST\n"
     )
-    init, segs = picture.read_playlist(str(tmp_path / "playlist.m3u8"))
+    init, segs = fmp4.read_playlist(str(tmp_path / "playlist.m3u8"))
     assert init == str(tmp_path / "init.mp4")
-    assert segs == [
-        (0.0, str(tmp_path / "seg-00001.m4s"), 6.0),
-        (6.0, str(tmp_path / "seg-00002.m4s"), 5.5),
-    ]
-    assert picture.pick_segments(segs, [1.0, 2.0, 7.0]) == [
-        (0.0, str(tmp_path / "seg-00001.m4s")),
-        (6.0, str(tmp_path / "seg-00002.m4s")),
+    assert [(s.start, s.duration, Path(s.path).name) for s in segs] == [
+        (0.0, 6.0, "seg-00000.m4s"),
+        (6.0, 4.5, "seg-00001.m4s"),
     ]
 
 
 @pytest.mark.parametrize(
-    "line", ["#EXT-X-BYTERANGE:1000@0\nall.mp4", "../other/seg.m4s", "https://example.com/seg.m4s"]
+    "line",
+    ["#EXT-X-BYTERANGE:1000@0\nall.mp4", "../other/seg.m4s", "https://cdn.test/seg.m4s"],
 )
 def test_a_playlist_of_ranges_or_of_other_folders_is_not_read(tmp_path: Path, line: str) -> None:
-    (tmp_path / "p.m3u8").write_text(f'#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:6.0,\n{line}\n')
-    assert picture.read_playlist(str(tmp_path / "p.m3u8")) == (None, [])
+    (tmp_path / "p.m3u8").write_text(f'#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:6,\n{line}\n')
+    with pytest.raises(fmp4.Unreadable):
+        fmp4.read_playlist(str(tmp_path / "p.m3u8"))
 
 
 def box(kind: bytes, body: bytes) -> bytes:
     return struct.pack(">I4s", 8 + len(body), kind) + body
 
 
-def test_a_fragments_first_frame_ends_where_its_header_says() -> None:
-    # tfhd: default-base-is-moof; trun: a data offset, sizes per sample.
-    tfhd = box(b"tfhd", struct.pack(">I", 0x020000) + struct.pack(">I", 1))
-    trun = box(
-        b"trun",
-        struct.pack(">I", 0x000201)
-        + struct.pack(">I", 2)
-        + struct.pack(">i", 0)
-        + struct.pack(">I", 5000)
-        + struct.pack(">I", 900),
+def full(kind: bytes, flags: int, body: bytes, version: int = 0) -> bytes:
+    return box(kind, struct.pack(">I", (version << 24) | flags) + body)
+
+
+def test_an_init_segment_says_its_decoder_its_frame_and_its_turn() -> None:
+    hvcc = b"\x01" + b"\x00" * 22
+    entry = b"\x00" * 24 + struct.pack(">HH", 1920, 1080) + b"\x00" * 50
+    entry += box(b"hvcC", hvcc) + box(b"pasp", struct.pack(">II", 4, 3))
+    stsd = full(b"stsd", 0, struct.pack(">I", 1) + box(b"hvc1", entry))
+    # a 90 degree turn: a=0, b=1, c=-1, d=0 (16.16)
+    matrix = struct.pack(">9i", 0, 1 << 16, 0, -(1 << 16), 0, 0, 0, 0, 1 << 30)
+    tkhd = full(b"tkhd", 3, b"\x00" * 20 + b"\x00" * 16 + matrix + struct.pack(">II", 0, 0))
+    mdhd = full(b"mdhd", 0, b"\x00" * 8 + struct.pack(">I", 24000) + b"\x00" * 8)
+    trak = box(b"trak", tkhd + box(b"mdia", mdhd + box(b"minf", box(b"stbl", stsd))))
+    trex = full(b"trex", 0, struct.pack(">IIIII", 1, 1, 1001, 0, 0x00010000))
+    init = fmp4.parse_init(box(b"moov", trak + box(b"mvex", trex)))
+    assert (init.codec, init.width, init.height, init.timescale) == ("hevc", 1920, 1080, 24000)
+    assert init.extradata == hvcc and init.sar == (4, 3) and init.rotation == 90
+    assert (init.default_duration, init.default_flags) == (1001, 0x00010000)
+
+
+def test_a_fragment_lists_its_sync_samples_by_their_bytes(tmp_path: Path) -> None:
+    # Three samples of 100, 40 and 60 bytes after the moof; the first is a
+    # sync sample (first_sample_flags), the others take the default flags
+    # of the track (non-sync), the third has its own flags (sync).
+    init = fmp4.Init("h264", b"", 640, 360, 1000, default_duration=500, default_flags=0x00010000)
+    tfhd = full(b"tfhd", 0x020000, struct.pack(">I", 1))  # default-base-is-moof
+    tfdt = full(b"tfdt", 0, struct.pack(">I", 6000))
+    trun_body = struct.pack(">IiI", 3, 0, 0)  # count, data offset (patched), first flags
+    trun_body += (
+        struct.pack(">II", 100, 0) + struct.pack(">II", 40, 0x00010000) + struct.pack(">II", 60, 0)
     )
-    traf = box(b"traf", tfhd + trun)
-    moof_len = 8 + 16 + len(traf)
-    # the data offset is from the moof's start to the mdat's payload
-    trun = box(
-        b"trun",
-        struct.pack(">I", 0x000201)
-        + struct.pack(">I", 2)
-        + struct.pack(">i", moof_len + 8)
-        + struct.pack(">I", 5000)
-        + struct.pack(">I", 900),
-    )
-    moof = box(b"moof", box(b"mfhd", struct.pack(">II", 0, 1)) + box(b"traf", tfhd + trun))
-    styp = box(b"styp", b"msdh\0\0\0\0")
-    seg = styp + moof + struct.pack(">I4s", 8 + 5900, b"mdat")
-    assert picture.first_frame_end(seg) == len(styp) + len(moof) + 8 + 5000
-    assert picture.first_frame_end(styp) is None
+    for _ in range(2):
+        trun = full(b"trun", 0x1 | 0x4 | 0x200 | 0x400, trun_body)
+        moof = box(
+            b"moof", full(b"mfhd", 0, struct.pack(">I", 1)) + box(b"traf", tfhd + tfdt + trun)
+        )
+        trun_body = struct.pack(">IiI", 3, len(moof) + 8, 0) + trun_body[12:]
+    seg = tmp_path / "seg.m4s"
+    seg.write_bytes(moof + box(b"mdat", b"\x00" * 200))
+    got, read = fmp4.samples(fmp4.Segment(6.0, 1.5, str(seg)), init, sync_only=False)
+    assert [(s.pts, s.sync, s.offset, s.size) for s in got] == [
+        (6000, True, len(moof) + 8, 100),
+        (6500, False, len(moof) + 108, 40),
+        (7000, True, len(moof) + 148, 60),
+    ]
+    assert read == len(moof) + 16 + 16  # the box headers and the moof
+    keys, _read = fmp4.samples(fmp4.Segment(6.0, 1.5, str(seg)), init)
+    assert [s.pts for s in keys] == [6000, 7000]
 
 
-# ------------------------------------------------- videos ffmpeg makes here
-def _encoder() -> bool:
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        return False
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
-    return "libx264" in r.stdout
+# ---------------------------------------------------- the measurement itself
+def test_a_measurement_that_saw_its_file_change_says_nothing(monkeypatch, tmp_path) -> None:
+    calls = {"n": 0}
+
+    def identity(paths: list[str]) -> list:
+        calls["n"] += 1
+        return [(calls["n"], 0, 0, 0)]
+
+    class Source:
+        video = sources.Video("h264", W, H)
+        sampling = sources.Sampling(mode="keyframes", duration_s=600)
+
+        def run(self, sink):
+            for i in range(40):
+                sink(float(i), _Frame(i), True)
+            return self.sampling
+
+    monkeypatch.setattr(sources, "identity", identity)
+    monkeypatch.setattr(sources, "open_source", lambda *_a: Source())
+    monkeypatch.setattr(planes, "reduce_frame", lambda f: reduced(seed=f.seed))
+    out = child.run(str(tmp_path / "film.mkv"), 600_000)
+    assert out["error"] == "the file changed while it was measured" and "area" not in out
 
 
-needs_ffmpeg = pytest.mark.skipif(not _encoder(), reason="needs ffmpeg and ffprobe with libx264")
-
-ENC = [
-    "-c:v",
-    "libx264",
-    "-preset",
-    "ultrafast",
-    "-crf",
-    "23",
-    "-g",
-    "10",
-    "-keyint_min",
-    "10",
-    "-sc_threshold",
-    "0",
-    "-pix_fmt",
-    "yuv420p",
-]
+class _Frame:
+    def __init__(self, seed: int) -> None:
+        self.seed = seed
 
 
-def _ffmpeg(*args: str) -> None:
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *args], check=True
-    )
+def test_a_measurement_whose_samples_fail_says_why(monkeypatch, tmp_path) -> None:
+    class Source:
+        video = sources.Video("h264", W, H)
+        sampling = sources.Sampling(mode="keyframes", duration_s=600)
+
+        def run(self, sink):
+            for i in range(40):
+                self.sampling.attempted += 1
+                if i % 10 == 0:
+                    self.sampling.fail("a keyframe decoded broken")
+                    continue
+                sink(float(i), _Frame(i), True)
+            return self.sampling
+
+    monkeypatch.setattr(sources, "identity", lambda paths: [None])
+    monkeypatch.setattr(sources, "open_source", lambda *_a: Source())
+    monkeypatch.setattr(planes, "reduce_frame", lambda f: reduced(seed=f.seed))
+    out = child.run(str(tmp_path / "film.mkv"), 600_000)
+    assert out["error"].startswith("4 of 40 samples failed, more than 1") and "area" not in out
 
 
-def _src(w: int, h: int, d: int = 30) -> str:
-    return f"testsrc2=size={w}x{h}:rate=10:duration={d}"
+def test_the_process_is_stopped_at_its_deadline_and_says_nothing(tmp_path: Path) -> None:
+    # A "video" the child can't open fast: a FIFO no one writes to.
+    import os
+
+    fifo = tmp_path / "never.mkv"
+    os.mkfifo(fifo)
+    t0 = time.monotonic()
+    m = picture.measure(str(fifo), 1_000, deadline=time.time() + 1.5)
+    assert m.interrupted and m.area is None and m.reason == "stopped before it was done"
+    assert time.monotonic() - t0 < 10
+    stopped = picture.measure(str(fifo), 1_000, stop=lambda: True)
+    assert stopped.interrupted
 
 
-def _glyphs(y: int, start: int, end: int) -> str:
-    on = f"enable='between(t,{start},{end})'"
-    box = "drawbox=x={x}:y={y}:w=8:h=10:color=white:t=fill:{on}"
-    return "".join("," + box.format(x=100 + g * 12, y=y, on=on) for g in range(10))
+def test_the_process_says_what_it_could_not_read(tmp_path: Path) -> None:
+    bad = tmp_path / "not-a-video.mkv"
+    bad.write_bytes(b"\x00" * 4096)
+    m = picture.measure(str(bad), 60_000)
+    assert m.area is None and m.error and m.error.startswith("the file can't be opened")
+    assert m.cpu_seconds > 0 and m.max_rss_bytes > 0
+    assert m.report()["method"] == picture.METHOD == "picture/2"
 
 
-VIDEOS = {
-    # a 2.39 picture letterboxed: 320x134 at y=22 in a 320x180 frame
-    "letterbox": (
-        ["-f", "lavfi", "-i", _src(320, 134), "-vf", "pad=320:180:0:22:black"],
-        Box(0, 22, 320, 134),
-    ),
-    "pillarbox": (
-        ["-f", "lavfi", "-i", _src(240, 180), "-vf", "pad=320:180:40:0:black"],
-        Box(40, 0, 240, 180),
-    ),
-    "windowbox": (
-        ["-f", "lavfi", "-i", _src(240, 100), "-vf", "pad=320:180:40:40:black"],
-        Box(40, 40, 240, 100),
-    ),
-    # dark from 8 s to 20 s, then a fade to black from 24 s
-    "dark": (
-        [
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 134),
-            "-vf",
-            "eq=brightness=-0.45:enable='between(t,8,20)',fade=t=out:st=24:d=6,pad=320:180:0:22:black",
-        ],
-        Box(0, 22, 320, 134),
-    ),
-    # 2.39 for 20 s, then the full 16:9 frame: the largest is the frame
-    "aspect": (
-        [
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 134, 20),
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 180, 10),
-            "-filter_complex",
-            "[0:v]pad=320:180:0:22:black[a];[a][1:v]concat=n=2:v=1:a=0",
-        ],
-        Box(0, 0, 320, 180),
-    ),
-    # 2.39 with 1.85 (320x172 at y=4) from 10 s to 20 s: the union
-    "aspect185": (
-        [
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 134, 10),
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 172, 10),
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 134, 10),
-            "-filter_complex",
-            "[0:v]pad=320:180:0:22:black[a];[1:v]pad=320:180:0:4:black[b];"
-            "[2:v]pad=320:180:0:22:black[c];[a][b][c]concat=n=3:v=1:a=0",
-        ],
-        Box(0, 4, 320, 172),
-    ),
-    # grain over the whole frame, the bars too
-    "noise": (
-        ["-f", "lavfi", "-i", _src(320, 134), "-vf", "pad=320:180:0:22:black,noise=c0s=14:allf=t"],
-        Box(0, 22, 320, 134),
-    ),
-    # a white subtitle in the bottom bar from 10 s to 16 s: that bar is kept
-    "subtitle": (
-        [
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 134),
-            "-vf",
-            "pad=320:180:0:22:black" + _glyphs(164, 10, 16),
-        ],
-        Box(0, 22, 320, 158),
-    ),
-    # a grey logo in the top bar the whole time: left out
-    "logo": (
-        [
-            "-f",
-            "lavfi",
-            "-i",
-            _src(320, 134),
-            "-vf",
-            "pad=320:180:0:22:black,drawbox=x=290:y=6:w=24:h=11:color=0xb0b0b0@0.7:t=fill",
-        ],
-        Box(0, 22, 320, 134),
-    ),
-    "full": (["-f", "lavfi", "-i", _src(320, 180)], Box(0, 0, 320, 180)),
-}
-
-
-@pytest.fixture(scope="module")
-def videos(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    d = tmp_path_factory.mktemp("videos")
-    for name, (args, _want) in VIDEOS.items():
-        _ffmpeg(*args, *ENC, str(d / f"{name}.mkv"))
-    # the letterbox as a package's video rendition: fMP4 HLS, 3 s segments
-    (d / "pkg").mkdir()
-    _ffmpeg(
-        "-i",
-        str(d / "letterbox.mkv"),
-        "-c",
-        "copy",
-        "-f",
-        "hls",
-        "-hls_segment_type",
-        "fmp4",
-        "-hls_time",
-        "3",
-        "-hls_playlist_type",
-        "vod",
-        "-hls_fmp4_init_filename",
-        "init.mp4",
-        "-hls_segment_filename",
-        str(d / "pkg" / "seg-%05d.m4s"),
-        str(d / "pkg" / "playlist.m3u8"),
-    )
-    return d
-
-
-@needs_ffmpeg
-@pytest.mark.parametrize("name", list(VIDEOS))
-def test_a_video_measures_as_drawn(videos: Path, name: str) -> None:
-    m = picture.measure(str(videos / f"{name}.mkv"), None, interval_s=1.0)
-    assert m.error is None and m.reason is None, (m.error, m.reason, m.sides)
-    assert m.frame == Box(0, 0, 320, 180)
-    want = VIDEOS[name][1]
-    if name == "noise":
-        # Grain in a bar may light the guard band at the edge, which the
-        # area then takes in: never less than the picture, at most the band
-        # more on a side.
-        a, guard = m.area, 2 * max(2, round(180 * picture.GUARD))
-        assert a.x <= want.x and a.y <= want.y, m.sides
-        assert (
-            a.x + a.width >= want.x + want.width and a.y + a.height >= want.y + want.height
-        ), m.sides
-        assert want.y - a.y <= guard and (a.y + a.height) - (want.y + want.height) <= guard, m.sides
-    else:
-        assert m.area == want, m.sides
-    assert m.samples >= picture.MIN_INFORMATIVE and m.cpu_seconds > 0
-    body = m.report()
-    assert body["frame"] == {"width": 320, "height": 180}
-    assert body["method"] == picture.METHOD
-
-
-@needs_ffmpeg
-def test_a_package_is_measured_a_segments_first_frame_at_a_time(videos: Path) -> None:
-    m = picture.measure(str(videos / "pkg" / "playlist.m3u8"), None, interval_s=1.0)
-    assert m.area == Box(0, 22, 320, 134), (m.error, m.reason, m.sides)
-    assert m.samples == 10  # one a segment
-
-
-@needs_ffmpeg
-def test_a_segment_cut_after_its_first_frame_reduces_as_the_whole_one(videos: Path) -> None:
-    pkg = videos / "pkg"
-    init, segs = picture.read_playlist(str(pkg / "playlist.m3u8"))
-    cut = picture._Job(0.0, init=init, segment=segs[3][1]).run("ffmpeg", picture._Cpu())
-    whole = picture._reduce(
-        "ffmpeg", ["-i", picture._concat(init, segs[3][1])], None, picture._Cpu()
-    )
-    assert cut is not None and cut == whole
-    head = picture._segment_head(init, segs[3][1])
-    assert (
-        head is not None
-        and len(head) < (pkg / "init.mp4").stat().st_size + Path(segs[3][1]).stat().st_size
-    )
-
-
-@needs_ffmpeg
-def test_a_full_hd_letterbox_of_a_wide_film(tmp_path: Path) -> None:
-    # A 2.39 film in a 1920x1080 frame: its picture 1920x804, 138 lines of
-    # bar above and below.
-    path = tmp_path / "wide.mkv"
-    _ffmpeg(
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc2=size=1920x804:rate=2:duration=12",
-        "-vf",
-        "pad=1920:1080:0:138:black",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "23",
-        "-g",
-        "2",
-        "-pix_fmt",
-        "yuv420p",
-        str(path),
-    )
-    m = picture.measure(str(path), None)
-    assert m.area == Box(0, 138, 1920, 804), (m.error, m.reason, m.sides)
-
-
-@needs_ffmpeg
-def test_what_cant_be_read_says_why(tmp_path: Path) -> None:
-    junk = tmp_path / "junk.mkv"
-    junk.write_bytes(b"\x1a\x45\xdf\xa3 not a video")
-    m = picture.measure(str(junk), 60_000)
-    assert m.area is None and m.error and not m.interrupted
-    assert "error" in m.report()
-
-
-@needs_ffmpeg
-def test_a_measurement_past_its_deadline_says_nothing(videos: Path) -> None:
-    m = picture.measure(str(videos / "letterbox.mkv"), None, interval_s=1.0, deadline=0.0)
-    assert m.interrupted and m.area is None
-    m = picture.measure(str(videos / "letterbox.mkv"), None, interval_s=1.0, stop=lambda: True)
-    assert m.interrupted
+def test_the_decoder_is_named(tmp_path: Path) -> None:
+    assert child.decoder().startswith("av ")
+    assert sys.modules["av"].__version__ in child.decoder()

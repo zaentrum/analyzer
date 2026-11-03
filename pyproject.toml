@@ -21,6 +21,12 @@ dependencies = [
   # faster-whisper bundles CTranslate2 (CUDA-capable). The Dockerfile installs
   # the matching CUDA libs.
   "faster-whisper==1.1.0",
+  # The picture-area measurement decodes with PyAV, whose wheel brings its
+  # own FFmpeg libraries (8.1 for 18.1.0): the system's ffmpeg is never in
+  # between, and the planes it reads are the same wherever it runs. numpy
+  # reduces them. Both pinned: the rules' levels are of these decoders.
+  "av==18.1.0",
+  "numpy==2.4.6",
 ]
 
 [project.optional-dependencies]

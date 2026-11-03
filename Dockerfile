@@ -50,7 +50,7 @@ RUN pip install --upgrade pip setuptools wheel
 WORKDIR /app
 RUN pip install httpx==0.28.1 structlog==25.4.0 fastapi==0.118.0 \
                 "uvicorn[standard]==0.32.0" faster-whisper==1.1.0 \
-                confluent-kafka==2.5.3
+                confluent-kafka==2.5.3 av==18.1.0 numpy==2.4.6
 
 COPY pyproject.toml ./
 COPY src ./src
