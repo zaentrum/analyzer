@@ -83,11 +83,20 @@ def measured(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int | None, flo
         *,
         deadline: float | None = None,
         stop=None,
+        probe: bool = False,
     ) -> picture.Measurement:
         calls.append((path, duration_ms, deadline))
         if (deadline is not None and deadline <= 0) or (stop is not None and stop()):
             return picture.Measurement(
-                path=path, interrupted=True, reason="stopped before it was done"
+                path=path, interrupted=True, reason="stopped before it was done", seconds=21_600
+            )
+        if probe:
+            return picture.Measurement(
+                path=path,
+                frame=picture.Box(0, 0, 1920, 1080),
+                video={"codec": "hevc", "sar": "1:1"},
+                measured_on={"kind": "package"},
+                sampling={"mode": "probe", "durationS": 7200.0},
             )
         return picture.Measurement(
             path=path,
@@ -140,7 +149,7 @@ def item(item_id: str = EPISODE, kind: str = "episode") -> ClaimedItem:
 def test_a_claims_titles_are_measured_and_reported_with_their_tokens(measured) -> None:
     catalog = Catalog([claim(FILM_JOB, EXTRA_JOB)])
     assert worker(catalog).claim_once() == 0  # titles were handed out: ask again at once
-    assert catalog.asked == [{"worker": "analyzer-0", "limit": 1, "method": "picture/3"}]
+    assert catalog.asked == [{"worker": "analyzer-0", "limit": 1, "method": "picture/4"}]
     deadline = datetime(2026, 11, 3, 17, 0, tzinfo=UTC).timestamp()
     assert measured == [
         (FILM_JOB["path"], 7_200_000, deadline),
@@ -153,7 +162,7 @@ def test_a_claims_titles_are_measured_and_reported_with_their_tokens(measured) -
     body = catalog.reports[0][1]
     assert body["area"] == {"x": 0, "y": 138, "width": 1920, "height": 804}
     assert body["frame"] == {"width": 1920, "height": 1080} and body["path"] == FILM_JOB["path"]
-    assert body["token"] == "token-of-the-film" and body["method"] == "picture/3"
+    assert body["token"] == "token-of-the-film" and body["method"] == "picture/4"
 
 
 def test_a_measurement_past_its_deadline_gives_its_title_back(measured) -> None:
@@ -165,6 +174,32 @@ def test_a_measurement_past_its_deadline_gives_its_title_back(measured) -> None:
             {"released": True, "path": FILM_JOB["path"], "token": "token-of-the-film"},
         )
     ]
+
+
+def test_the_last_run_of_a_title_too_costly_to_measure_says_so(measured) -> None:
+    # Its runs before had their whole lease and did not finish either: past
+    # its deadline the last run reports the title too costly to measure, an
+    # unknown of what a probe of the file says it is.
+    job = {**FILM_JOB, "costlyRuns": 2, "last": True}
+    catalog = Catalog([claim(job, deadline="1970-01-01T00:00:00Z")])
+    worker(catalog).claim_once()
+    [(path, body)] = catalog.reports
+    assert path == f"/api/picture/items/{FILM}" and body["token"] == "token-of-the-film"
+    assert "released" not in body and body["area"] is None and body["seconds"] == 21_600
+    assert body["frame"] == {"width": 1920, "height": 1080} and body["video"]["codec"] == "hevc"
+    assert body["sampling"]["doubt"] == ["cost"] and body["sampling"]["costlyRuns"] == 3
+    assert body["reason"] == (
+        "can't tell: too costly to measure: 3 runs of 360 min each did not finish"
+    )
+    assert measured[-1][2] > time.time()  # the probe has a deadline of its own
+
+
+def test_a_last_run_stopped_with_its_worker_gives_its_title_back(measured) -> None:
+    catalog = Catalog([claim({**FILM_JOB, "costlyRuns": 2, "last": True})])
+    w = worker(catalog)
+    w.stop.set()
+    w.claim_once()
+    assert [b.get("released") for _p, b in catalog.reports] == [True]
 
 
 def test_titles_in_hand_when_the_worker_stops_are_given_back(measured) -> None:
@@ -221,9 +256,9 @@ def test_a_current_area_of_this_method_is_not_measured_again(measured, state) ->
 @pytest.mark.parametrize(
     "have",
     [
-        {"state": "measured", "current": False, "method": "picture/3"},
-        {"state": "measured", "current": True, "method": "picture/2"},
-        {"state": "failed", "current": True, "method": "picture/3"},
+        {"state": "measured", "current": False, "method": "picture/4"},
+        {"state": "measured", "current": True, "method": "picture/3"},
+        {"state": "failed", "current": True, "method": "picture/4"},
     ],
 )
 def test_an_area_of_another_file_or_method_is_measured_again(measured, have) -> None:

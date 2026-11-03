@@ -1,8 +1,13 @@
 """Where a measurement's samples come from: the frames of a title, decoded
-from a file opened once, each labelled with its own presentation time.
+from a file opened once, each labelled with its own presentation time and
+handed on as its segment means (planes.Segs).
 
 The title's bar black is read first (calibrate()): the edges of CALIBRATION
-frames spread over it (planes.py). Then the samples.
+keyframes spread evenly over it (planes.py), which are then its first
+samples. Then the rest of them, until the sink says the area is decided:
+the whole frame, as soon as every side's picture reaches the frame's edge
+(rules.Accumulator.at_edges). An area that crops anything is decided only by
+all the samples below.
 
 An original is read so that no two samples are more than TARGET_GAP_S
 apart anywhere, its start and its end too:
@@ -89,7 +94,9 @@ GOP_HOLD_MAX = 64 << 20
 # A package's keyframe passes before the stretches, and after them.
 COARSE, FINE = (16, 8), (4, 2, 1)
 
-Sink = Callable[[float, Any, bool], None]
+# sink(time, segs, counted) takes a sample, and answers True once the area
+# is decided (the measurement stops there).
+Sink = Callable[[float, "planes.Segs", bool], bool | None]
 
 
 class Unreadable(Exception):
@@ -108,8 +115,9 @@ class Sampling:
     failed, the keyframes it sought and decoded another frame for
     (missed), the frames it decoded twice (duplicates), the frames read to
     find the bar black (calibration), the bytes it read to open the file
-    and in all, the budget and whether it stopped there, and the samples'
-    own times."""
+    and in all, the budget and whether it stopped there, whether it stopped
+    early because the area was decided (stopped_early, at the time of the
+    sample that decided it), and the samples' own times."""
 
     mode: str = ""
     duration_s: float = 0.0
@@ -125,6 +133,8 @@ class Sampling:
     bytes_read: int = 0
     budget: int = 0
     stopped: str | None = None
+    stopped_early: bool = False
+    stopped_at: float | None = None
     times: list[float] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -289,11 +299,26 @@ class _Counting(io.RawIOBase):
         super().close()
 
 
+THREADS = 2
+
+
 def _threads() -> int:
+    """The decoder's threads (PICTURE_THREADS, THREADS)."""
     try:
-        return min(max(int(os.environ.get("PICTURE_THREADS") or 1), 1), 8)
+        return min(max(int(os.environ.get("PICTURE_THREADS") or THREADS), 1), 8)
     except ValueError:
-        return 1
+        return THREADS
+
+
+def _threaded(cc: Any) -> None:
+    """A decoder's threads, before it opens: HEVC's share each frame (its
+    rows of coding units, as encoders write it in wavefronts), the keyframe
+    decoded alone too; the others' share frames, which a group of pictures
+    decoded through has many of."""
+    n = _threads()
+    cc.thread_count = n
+    if n > 1:
+        cc.thread_type = "SLICE" if cc.name == "hevc" else "AUTO"
 
 
 class _Taker:
@@ -362,51 +387,85 @@ class _Source:
     def __init__(self) -> None:
         self.blacks = {}
         self._seen: set[int] = set()
+        # the samples the calibration took, and whether the area is decided
+        self._calibration_keys: set[int] = set()
+        self._done = False
+        self._sized = False
 
     def _spent(self) -> int:
         """The bytes read so far, besides opening the file."""
         raise NotImplementedError
 
     def _over(self) -> bool:
+        """Whether to read no further: the area is decided, or the read
+        budget is spent."""
+        if self._done:
+            return True
         sm = self.sampling
         if self._spent() >= sm.budget:
             sm.stopped = "budget"
             return True
         return False
 
-    def _calibrated(self, seen: list[dict[str, tuple[float, float]]]) -> None:
+    def _calibrated(self, seen: list[tuple[float, planes.Segs]], sink: Sink) -> None:
+        """The title's bar black of the calibration's frames (their times
+        and segment means), and those frames its first samples: spread
+        evenly over the title, they decide a picture in the whole frame
+        soonest."""
         sm = self.sampling
         sm.calibration = len(seen)
         if len(seen) < CALIBRATION_MIN:
             raise Unreadable(
                 f"only {len(seen)} of {CALIBRATION} frames spread over the title could be read"
             )
-        self.blacks = planes.calibrate(seen)
+        self.blacks = planes.calibrate([planes.edges_of(segs) for _t, segs in seen])
+        for t, segs in seen:
+            key = round(t * 1000)
+            if key in self._seen or self._done:
+                continue  # two seeks that found the same keyframe
+            sm.attempted += 1
+            self._calibration_keys.add(key)
+            self._hand(t, segs, sink, True)
 
-    def _take(self, frame: Any, t: float, sink: Sink, counted: bool = True) -> bool:
-        """Hand a decoded frame at its own time t to sink; False when it is
-        taken already (a frame decoded twice)."""
+    def _admit(self, frame: Any) -> bool:
+        """Whether a decoded frame is of the title's frame: its size the
+        video's (the first frame's sets it: what the frames are is what the
+        players show), else a failure. A rotated video can't be told."""
         sm = self.sampling
-        key = round(t * 1000)
-        if key in self._seen:
-            return False
         if frame.width != self.video.width or frame.height != self.video.height:
-            if sm.decoded == 0:
-                # what the frames are is what the players show
+            if not self._sized:
                 self.video.width, self.video.height = frame.width, frame.height
             else:
                 sm.fail(
                     f"a frame of {frame.width}x{frame.height} in a video of "
                     f"{self.video.width}x{self.video.height}"
                 )
-                return True
+                return False
         if frame.rotation:
             raise Undecidable(f"the video is rotated by {frame.rotation % 360} degrees")
-        self._seen.add(key)
+        self._sized = True
+        return True
+
+    def _take(self, frame: Any, t: float, sink: Sink, counted: bool = True) -> bool:
+        """Hand a decoded frame at its own time t to sink; False when it is
+        taken already (a frame decoded twice)."""
+        if self._done:
+            return True
+        if round(t * 1000) in self._seen:
+            return False
+        if self._admit(frame):
+            self._hand(t, planes.frame_segments(frame), sink, counted)
+        return True
+
+    def _hand(self, t: float, segs: planes.Segs, sink: Sink, counted: bool) -> None:
+        sm = self.sampling
+        self._seen.add(round(t * 1000))
         sm.decoded += 1
         sm.times.append(t)
-        sink(t, frame, counted)
-        return True
+        if sink(t, segs, counted):
+            # the area is decided: the whole frame
+            self._done = sm.stopped_early = True
+            sm.stopped_at = t
 
 
 # ------------------------------------------------------------- originals
@@ -438,7 +497,7 @@ class Original(_Source):
             if s is not v:
                 s.discard = av.stream.Discard.all
         cc = v.codec_context
-        cc.thread_count = _threads()
+        _threaded(cc)
         if not cc.width or not cc.height:
             self.close()
             raise Unreadable("the video stream has no size")
@@ -489,7 +548,8 @@ class Original(_Source):
         return sorted((self._time(ts), ts) for ts in keys)
 
     def run(self, sink: Sink) -> Sampling:
-        """Decode the samples, handing each to sink(time, frame, counted)."""
+        """Decode the samples, handing each to sink(time, segs, counted)
+        until it says the area is decided."""
         sm = self.sampling
         dur = max(sm.duration_s, self._catalog_s)
         size = self._io.size()
@@ -497,29 +557,30 @@ class Original(_Source):
         # the index as the container has it, before any seek of the
         # calibration's adds the keyframes it passes to it
         keys = self._index()
-        self._calibrate(sm.duration_s or dur)
+        times = [t for t, _ts in keys]
         if dur <= SHORT_S and size <= SEQUENTIAL_MAX_BYTES:
             sm.mode = "sequential"
             sm.planned = max(1, int(sm.duration_s / SEQUENTIAL_STEP_S))
-            self._stream(sink, everything=True)
+        elif len(times) >= 2 and _max_gap(times, sm.duration_s) <= INDEX_GAP_MAX_S:
+            sm.mode = "keyframes"
         else:
-            times = [t for t, _ts in keys]
-            if len(times) >= 2 and _max_gap(times, sm.duration_s) <= INDEX_GAP_MAX_S:
-                sm.mode = "keyframes"
+            sm.mode = "stream"
+        self._calibrate(sm.duration_s or dur, sink)
+        if not self._done:
+            if sm.mode == "keyframes":
                 self._indexed(keys, sink)
             else:
-                sm.mode = "stream"
-                self._stream(sink, everything=False)
+                self._stream(sink, everything=sm.mode == "sequential")
         sm.bytes_read = self._io.bytes
         return sm
 
-    def _calibrate(self, dur: float) -> None:
+    def _calibrate(self, dur: float, sink: Sink) -> None:
         seen = []
         for k in range(CALIBRATION):
             frame = self._seek_frame(self._ts((k + 0.5) * dur / CALIBRATION), False, count=False)
-            if frame is not None:
-                seen.append(planes.frame_edges(frame))
-        self._calibrated(seen)
+            if frame is not None and self._admit(frame):
+                seen.append((self._time(frame.pts), planes.frame_segments(frame)))
+        self._calibrated(seen, sink)
 
     def _seek_frame(
         self, ts: int, keyframe_only: bool, count: bool = True, after: float | None = None
@@ -764,7 +825,10 @@ class Original(_Source):
         if not frames or frames[0].is_corrupt or frames[0].pts is None:
             sm.fail("a keyframe gave no frame" if not frames else "a keyframe decoded broken")
             return
-        if not self._take(frames[0], self._time(frames[0].pts), sink, True):
+        t = self._time(frames[0].pts)
+        taken = self._take(frames[0], t, sink, True)
+        if not taken and round(t * 1000) not in self._calibration_keys:
+            # (a keyframe the calibration took is no frame decoded twice)
             sm.duplicates += 1
 
     def _decode_gop(
@@ -787,6 +851,8 @@ class Original(_Source):
 
         def hand(frames: list[Any]) -> None:
             for frame in frames:
+                if self._done:
+                    return
                 # nothing before the first keyframe, nothing broken: a
                 # decoder conceals what it lacks with grey
                 taker.keyed = taker.keyed or frame.key_frame
@@ -862,7 +928,7 @@ class Package(_Source):
         try:
             self._cc = av.CodecContext.create(i.codec, "r")
             self._cc.extradata = i.extradata or None
-            self._cc.thread_count = _threads()
+            _threaded(self._cc)
         except (av.error.FFmpegError, ValueError) as e:
             raise Unreadable(f"no decoder for {i.codec}: {e}") from e
         self._file: tuple[str, Any] | None = None
@@ -907,10 +973,13 @@ class Package(_Source):
             self._keys, self._times = keys, [k.pts / ts for k in keys]
             if not keys:
                 raise Unreadable("the rendition has no sync sample")
-            self._calibrate()
             size = sum(os.path.getsize(s.path) for s in self._segments)
-            if dur <= SHORT_S and size <= SEQUENTIAL_MAX_BYTES:
-                sm.mode = "package-sequential"
+            sequential = dur <= SHORT_S and size <= SEQUENTIAL_MAX_BYTES
+            sm.mode = "package-sequential" if sequential else "package"
+            self._calibrate(sink)
+            if self._done:
+                return sm
+            if sequential:
                 sm.budget = max(sm.budget, 2 * size)
                 sm.planned = max(1, int(sm.duration_s / SEQUENTIAL_STEP_S))
                 taker = _Taker(self, sink, True)
@@ -925,14 +994,15 @@ class Package(_Source):
             self.close()
         return sm
 
-    def _calibrate(self) -> None:
+    def _calibrate(self, sink: Sink) -> None:
         n = len(self._keys)
         seen = []
         for k in range(CALIBRATION):
-            got = self._key(min(n - 1, int((k + 0.5) * n / CALIBRATION)), count=False)
-            if got is not None:
-                seen.append(planes.frame_edges(got))
-        self._calibrated(seen)
+            i = min(n - 1, int((k + 0.5) * n / CALIBRATION))
+            got = self._key(i, count=False)
+            if got is not None and self._admit(got):
+                seen.append((self._times[i], planes.frame_segments(got)))
+        self._calibrated(seen, sink)
 
     def _keyframes_and_stretches(self, sink: Sink, dur: float) -> None:
         """The sync samples, coarse to fine, and the stretches."""
@@ -1007,7 +1077,7 @@ class Package(_Source):
 
         def frames() -> Iterator[Any]:
             for s in samples:
-                if s.dts / ts > b + 2.0:
+                if s.dts / ts > b + 2.0 or self._done:
                     break
                 try:
                     pkt = av.Packet(self._read(s))

@@ -21,7 +21,7 @@ from .rules import Box
 log = structlog.get_logger(__name__)
 
 # The measurement's version, kept with every area.
-METHOD = "picture/3"
+METHOD = "picture/4"
 # A measurement without a deadline of its own stops after this long.
 MAX_SECONDS = 3600.0
 # How often the parent looks at its deadline, and at stop.
@@ -113,12 +113,14 @@ def measure(
     *,
     deadline: float | None = None,
     stop: Callable[[], bool] | None = None,
+    probe: bool = False,
 ) -> Measurement:
     """Measure the picture area of the video at path: a file libavformat
     reads (an original), or a package's video rendition, its HLS media
     playlist (.m3u8). deadline (time.time()) and stop end it early: the
     result is interrupted and says nothing. Never raises for what the file
-    holds: a video that can't be read says why in error."""
+    holds: a video that can't be read says why in error. probe only opens
+    the file: its frame, its video and what it is, and no area."""
     t0 = time.monotonic()
     m = Measurement(path=path)
     if deadline is None:
@@ -131,6 +133,7 @@ def measure(
         "analyzer.pipelines.picture.child",
         path,
         str(int(duration_ms or 0)),
+        *(["--probe"] if probe else []),
     ]
     try:
         p = subprocess.Popen(

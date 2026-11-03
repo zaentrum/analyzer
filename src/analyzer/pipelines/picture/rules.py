@@ -197,6 +197,17 @@ class Accumulator:
         for name in SIDES:
             self.sides[name].add(r.sides[name], t, counted)
 
+    def at_edges(self) -> bool:
+        """Whether the area is the whole frame whatever samples come: each
+        side's outermost line is picture in a sample, by the whole line and
+        by its middle (so no logo is left out of it either), and enough
+        samples show a picture. The union only ever grows: no sample after
+        can bring a side's edge in."""
+        if not all(s.strict.all[0] > 0 and s.center.all[0] > 0 for s in self.sides.values()):
+            return False
+        need = max(MIN_INFORMATIVE, math.ceil(INFORMATIVE_SHARE * max(self.counted, 1)))
+        return self.counted_informative >= need
+
     def decide(self) -> Decision:
         """The picture area of the samples added, by the rules at the top of
         the file."""

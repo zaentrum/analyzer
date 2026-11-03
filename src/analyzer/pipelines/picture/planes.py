@@ -28,6 +28,11 @@ no bar black: its lines are all picture. A frame shows a picture when a
 segment anywhere is CONTENT levels from the darkest bar black, or
 CHROMA_LIT from neutral. What is kept of a frame is its zones' lines, a few
 bytes each.
+
+A frame is read in two steps: its segment means (segments(), Segs), which
+need no black, and those read against the title's bar black
+(reduce_segs()). So the frames the black is read off are kept as their
+segment means, and are samples once it is known.
 """
 
 from __future__ import annotations
@@ -89,6 +94,24 @@ class Reduced:
     shows: bool
 
 
+@dataclass
+class Segs:
+    """A frame's segment means, read once and against a bar black after: of
+    its luma and chroma planes along each row (yr, ur, vr: (rows,
+    SEGMENTS), the chroma's rows spread to the luma's) and along each column
+    (yc, uc, vc: (columns, SEGMENTS)), scaled to 8 bits. A frame kept so is
+    a megabyte or two, not the frame."""
+
+    width: int
+    height: int
+    yr: np.ndarray
+    ur: np.ndarray
+    vr: np.ndarray
+    yc: np.ndarray
+    uc: np.ndarray
+    vc: np.ndarray
+
+
 def zone(length: int) -> int:
     """How many lines of a side of length lines the rules read."""
     return max(1, min(length // 2, math.ceil(length * ZONE)))
@@ -147,6 +170,34 @@ def edges(
     return out
 
 
+def segments(y: np.ndarray, u: np.ndarray, v: np.ndarray, depth: int) -> Segs:
+    """A frame's Y, U and V planes (2-D arrays; the chroma ones subsampled or
+    not) of a format of depth bits, as its segment means (Segs)."""
+    h, w = y.shape
+    scale = np.float32(1.0 / (1 << max(0, depth - 8)))
+    yr, yc = (a * scale for a in _segments(y))
+    ur, uc = (a * scale for a in _segments(u))
+    vr, vc = (a * scale for a in _segments(v))
+    return Segs(w, h, yr, _spread(ur, h), _spread(vr, h), yc, _spread(uc, w), _spread(vc, w))
+
+
+def edges_of(s: Segs) -> dict[str, tuple[float, float]]:
+    """Each side's outermost line of a frame's segment means, as edges()
+    reads it of the planes."""
+    out: dict[str, tuple[float, float]] = {}
+    for name, ly, lu, lv in (
+        ("top", s.yr[0], s.ur[0], s.vr[0]),
+        ("bottom", s.yr[-1], s.ur[-1], s.vr[-1]),
+        ("left", s.yc[0], s.uc[0], s.vc[0]),
+        ("right", s.yc[-1], s.uc[-1], s.vc[-1]),
+    ):
+        luma = float(np.asarray(ly, np.float64).mean())
+        cu = np.abs(np.asarray(lu, np.float64) - NEUTRAL)
+        cv = np.abs(np.asarray(lv, np.float64) - NEUTRAL)
+        out[name] = (luma, float(max(cu.max(), cv.max())))
+    return out
+
+
 def calibrate(seen: list[dict[str, tuple[float, float]]]) -> Blacks:
     """The title's bar black per side, of the edges of frames spread over it
     (edges()): the median of their outermost lines' luma, when that and the
@@ -169,13 +220,14 @@ def reduce_planes(
     """A frame's Y, U and V planes (2-D arrays; the chroma ones subsampled or
     not) of a format of depth bits, reduced against the title's bar blacks
     (see the top of the file)."""
-    h, w = y.shape
-    scale = np.float32(1.0 / (1 << max(0, depth - 8)))
-    yr, yc = (a * scale for a in _segments(y))
-    ur, uc = (a * scale for a in _segments(u))
-    vr, vc = (a * scale for a in _segments(v))
-    ur, vr = _spread(ur, h), _spread(vr, h)
-    uc, vc = _spread(uc, w), _spread(vc, w)
+    return reduce_segs(segments(y, u, v, depth), blacks)
+
+
+def reduce_segs(s: Segs, blacks: Blacks) -> Reduced:
+    """A frame's segment means (Segs) reduced against the title's bar
+    blacks (see the top of the file)."""
+    h, w = s.height, s.width
+    yr, ur, vr, yc, uc, vc = s.yr, s.ur, s.vr, s.yc, s.uc, s.vc
 
     sides: dict[str, SideLines] = {}
     zr, zc = zone(h), zone(w)
@@ -191,8 +243,8 @@ def reduce_planes(
             empty = np.zeros(z, np.float32)
             sides[name] = SideLines(None, empty, empty, np.zeros(z, np.uint32))
             continue
-        s, su, sv = ly[lines], lu[lines], lv[lines]
-        d = s - np.float32(black)
+        sy, su, sv = ly[lines], lu[lines], lv[lines]
+        d = sy - np.float32(black)
         chroma = np.maximum(np.abs(su - NEUTRAL), np.abs(sv - NEUTRAL))
         dim = (np.abs(d) > DIM) | (chroma > CHROMA_DIM)
         sides[name] = SideLines(
@@ -234,7 +286,11 @@ def frame_edges(frame) -> dict[str, tuple[float, float]]:
     return edges(y, u, v, depth)
 
 
+def frame_segments(frame) -> Segs:
+    """A decoded PyAV frame's segment means (Segs)."""
+    return segments(*frame_planes(frame))
+
+
 def reduce_frame(frame, blacks: Blacks) -> Reduced:
     """A decoded PyAV frame, reduced against the title's bar blacks."""
-    y, u, v, depth = frame_planes(frame)
-    return reduce_planes(y, u, v, depth, blacks)
+    return reduce_segs(frame_segments(frame), blacks)

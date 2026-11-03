@@ -301,6 +301,71 @@ def test_a_flat_grey_edge_of_a_wider_shot_is_picture() -> None:
     assert decide(*letterboxed(top=0, height=H, left=40, width=240), *pillar).area == FULL
 
 
+def test_a_frame_read_in_two_steps_is_read_as_at_once() -> None:
+    # Its segment means first, the bar black after: what the calibration's
+    # frames are kept as, to be samples once the black is known.
+    for kw in ({}, {"noise": 3.0, "seed": 4}, {"chroma": (90, 160), "seed": 2}):
+        y, u, v = yuv(**kw)
+        segs = planes.segments(y, u, v, 8)
+        two, one = planes.edges_of(segs), planes.edges(y, u, v, 8)
+        for name in planes.SIDES:
+            assert two[name] == pytest.approx(one[name], abs=1e-4)
+        once, twice = planes.reduce_planes(y, u, v, 8, BLACKS), planes.reduce_segs(segs, BLACKS)
+        assert once.shows == twice.shows
+        for name in planes.SIDES:
+            a, b = once.sides[name], twice.sides[name]
+            assert a.black == b.black and (a.dim == b.dim).all()
+            assert (a.dev_full == b.dev_full).all() and (a.dev_center == b.dev_center).all()
+
+
+def at_edges(*samples: planes.Reduced | tuple[planes.Reduced, bool]) -> list[bool]:
+    """Whether the area is the whole frame for good, after each sample."""
+    acc, out = rules.Accumulator(W, H), []
+    for i, s in enumerate(samples):
+        r, counted = s if isinstance(s, tuple) else (s, True)
+        acc.add(r, float(i), counted)
+        out.append(acc.at_edges())
+    return out
+
+
+def test_a_picture_at_every_edge_decides_the_whole_frame() -> None:
+    # The sixth sample that shows a picture decides it, and the area is the
+    # whole frame then and after.
+    full = letterboxed(10, top=0, height=H)
+    assert at_edges(*full) == [False] * 5 + [True] * 5
+    assert decide(*full[:6]).area == FULL
+
+
+def test_a_bar_anywhere_never_decides_early() -> None:
+    assert not any(at_edges(*letterboxed()))
+    assert not any(at_edges(*letterboxed(20, left=40, width=W - 80, top=0, height=H)))
+    # the top's picture at the frame's edge, a bar at the bottom: the axis
+    # is kept whole in the end, but not before every sample is in
+    high = letterboxed(20, top=0, height=H - 24)
+    assert not any(at_edges(*high)) and decide(*high).area == FULL
+
+
+def test_a_mark_at_a_corner_of_the_edge_decides_nothing() -> None:
+    # A logo in a corner of the outermost line is picture by the whole line,
+    # not by its middle: the logo rule may still leave it out.
+    marks = ((4, 0, 26, 10, 235),)
+    assert not any(at_edges(*letterboxed(20, top=10, height=H - 20, marks=marks)))
+
+
+def test_a_wider_shot_after_the_bars_decides_when_it_comes() -> None:
+    samples = [*letterboxed(30), *letterboxed(2, top=0, height=H)]
+    assert at_edges(*samples) == [False] * 30 + [True, True]
+    assert decide(*samples).area == FULL
+
+
+def test_samples_of_a_stretch_widen_but_are_not_enough_alone() -> None:
+    # A stretch's samples are no support: enough counted samples that show
+    # a picture are needed besides.
+    stretch = [(r, False) for r in letterboxed(10, top=0, height=H)]
+    assert not any(at_edges(*stretch))
+    assert at_edges(*stretch, *letterboxed(6, top=0, height=H))[-1]
+
+
 def test_the_counts_take_the_same_memory_for_any_number_of_samples() -> None:
     big_w, big_h = 3840, 2160
     y = np.full((big_h, big_w), 16, np.uint16) * 4
@@ -506,7 +571,8 @@ def test_a_measurement_that_saw_its_file_change_says_nothing(monkeypatch, tmp_pa
 
     monkeypatch.setattr(sources, "identity", identity)
     monkeypatch.setattr(sources, "open_source", lambda *_a: Source())
-    monkeypatch.setattr(planes, "reduce_frame", lambda f, blacks: reduced(blacks, seed=f.seed))
+    drawn = {i: reduced(seed=i) for i in range(40)}
+    monkeypatch.setattr(planes, "reduce_segs", lambda f, blacks: drawn[f.seed])
     out = child.run(str(tmp_path / "film.mkv"), 600_000)
     assert out["error"] == "the file changed while it was measured" and "area" not in out
 
@@ -533,7 +599,8 @@ def test_a_measurement_whose_samples_fail_says_why(monkeypatch, tmp_path) -> Non
 
     monkeypatch.setattr(sources, "identity", lambda paths: [None])
     monkeypatch.setattr(sources, "open_source", lambda *_a: Source())
-    monkeypatch.setattr(planes, "reduce_frame", lambda f, blacks: reduced(blacks, seed=f.seed))
+    drawn = {i: reduced(seed=i) for i in range(40)}
+    monkeypatch.setattr(planes, "reduce_segs", lambda f, blacks: drawn[f.seed])
     out = child.run(str(tmp_path / "film.mkv"), 600_000)
     assert out["error"].startswith("4 of 40 samples failed, more than 1") and "area" not in out
 
@@ -558,7 +625,7 @@ def test_the_process_says_what_it_could_not_read(tmp_path: Path) -> None:
     m = picture.measure(str(bad), 60_000)
     assert m.area is None and m.error and m.error.startswith("the file can't be opened")
     assert m.cpu_seconds > 0 and m.max_rss_bytes > 0
-    assert m.report()["method"] == picture.METHOD == "picture/3"
+    assert m.report()["method"] == picture.METHOD == "picture/4"
 
 
 def test_the_decoder_is_named(tmp_path: Path) -> None:

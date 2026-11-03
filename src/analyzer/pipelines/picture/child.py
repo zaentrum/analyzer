@@ -10,6 +10,11 @@ MAX_GAP_S apart anywhere in the title, when the read budget stopped it,
 when a seek decoded another frame than the keyframe it sought, or when a
 frame was decoded twice where another was due. The players then fit the
 whole frame, as without an area.
+
+The one area it says before it has every sample is the whole frame: as soon
+as every side's picture reaches the frame's edge (rules.Accumulator.at_edges)
+no sample can make the area smaller, and it stops there (sampling.stoppedEarly,
+with the samples it took and their largest gap as they are).
 """
 
 from __future__ import annotations
@@ -32,9 +37,10 @@ FAIL_SHARE = 0.03
 MAX_GAP_S = 3.0
 
 
-def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
+def run(path: str, duration_ms: int | None = None, probe: bool = False) -> dict[str, Any]:
     """Measure the video at path (an original, or a package's rendition);
-    the result as measure.py reads it."""
+    the result as measure.py reads it. probe: open it only (its frame, its
+    video, what it is), and sample nothing."""
     t0 = time.monotonic()
     out: dict[str, Any] = {"path": path, "decoder": decoder()}
     catalog_s = (duration_ms or 0) / 1000.0
@@ -57,14 +63,20 @@ def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
         "durationS": round(v.duration_s, 3),
     }
     out["measuredOn"] = _measured_on(src, before)
+    if probe:
+        if isinstance(src, sources.Original):
+            src.close()
+        out["sampling"] = {"mode": "probe", "durationS": round(src.sampling.duration_s, 3)}
+        return out
     acc: rules.Accumulator | None = None
 
-    def sink(t: float, frame: Any, counted: bool) -> None:
+    def sink(t: float, segs: Any, counted: bool) -> bool:
         nonlocal acc
-        r = planes.reduce_frame(frame, src.blacks)
+        r = planes.reduce_segs(segs, src.blacks)
         if acc is None:
             acc = rules.Accumulator(r.width, r.height)
         acc.add(r, t, counted)
+        return acc.at_edges()
 
     sm: sources.Sampling | None = None
     try:
@@ -79,6 +91,9 @@ def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
     sm = sm or src.sampling
     out["sampling"] = _sampling(sm)
     out["sampling"]["blacks"] = dict(src.blacks)
+    out["sampling"]["stoppedEarly"] = sm.stopped_early
+    if sm.stopped_at is not None:
+        out["sampling"]["stoppedAtS"] = round(sm.stopped_at, 2)
     out["frame"] = {"width": src.video.width, "height": src.video.height}
     out["seconds"] = round(time.monotonic() - t0, 2)
     if "reason" in out or "error" in out:
@@ -100,7 +115,8 @@ def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
     out["samples"], out["informative"] = d.samples, d.informative
     out["sides"] = d.sides
     out["reason"] = d.reason
-    codes, why = doubts(sm)
+    whole = d.area == rules.Box(0, 0, acc.width, acc.height)
+    codes, why = ([], []) if sm.stopped_early and whole else doubts(sm)
     out["sampling"]["doubt"] = codes
     if codes:
         out["reason"] = "can't tell: " + "; ".join(why)
@@ -184,7 +200,8 @@ def _sampling(sm: sources.Sampling) -> dict[str, Any]:
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(
-            "usage: python -m analyzer.pipelines.picture.child PATH [DURATION_MS]", file=sys.stderr
+            "usage: python -m analyzer.pipelines.picture.child PATH [DURATION_MS] [--probe]",
+            file=sys.stderr,
         )
         return 2
     try:
@@ -193,7 +210,7 @@ def main(argv: list[str]) -> int:
         pass
     duration_ms = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else None
     try:
-        out = run(argv[1], duration_ms)
+        out = run(argv[1], duration_ms, probe="--probe" in argv[3:])
     except Exception as e:  # the parent reads what failed
         out = {"path": argv[1], "error": f"{type(e).__name__}: {e}"[:500]}
     sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")

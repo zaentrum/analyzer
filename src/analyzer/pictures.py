@@ -16,8 +16,12 @@ Two kinds of title come to it:
     /api/picture/claim, naming its method), measures each and reports it
     with its claim's token. A measurement still running at its claim's
     deadline (the quiet hours' start, or the lease's end) gives its title
-    back ({"released": true}). When the catalog hands out nothing it waits
-    as long as the catalog says, or until a pass's title comes.
+    back ({"released": true}), but the last run the catalog allows a title
+    (the job's last: its runs before had their whole lease and did not
+    finish either): that one reports the title too costly to measure, an
+    unknown of what it read (its frame and video from a probe of the file,
+    sampling.doubt "cost"). When the catalog hands out nothing it waits as
+    long as the catalog says, or until a pass's title comes.
 
 A measurement runs in its own process at a lower priority (measure.py); the
 worker stops it at its deadline, and when the worker stops: a claim's title
@@ -44,14 +48,17 @@ from .pipelines import picture
 log = structlog.get_logger(__name__)
 
 # The analyze pass's titles waiting at most, and how long one's measurement
-# runs at most.
+# runs at most: as the catalog's lease, the whole measurement of a 3-hour 4K
+# remux with room to spare.
 QUEUE_MAX = 256
-PASS_DEADLINE_S = 1800.0
+PASS_DEADLINE_S = 6 * 3600.0
 # How long to wait when the catalog has no backfill (an older one), or can't
 # be asked; the bounds of a wait the catalog asks for when it hands out
 # nothing.
 NO_BACKFILL_WAIT_S = 600.0
 WAIT_MIN_S, WAIT_MAX_S = 30.0, 3600.0
+# How long a probe of a title too costly to measure runs at most.
+PROBE_S = 120.0
 
 
 @dataclass(frozen=True)
@@ -190,6 +197,13 @@ class PictureWorker:
             m = picture.measure(
                 path, job.get("durationMs"), deadline=deadline, stop=self.stop.is_set
             )
+        if m is not None and m.interrupted and job.get("last") and not self.stop.is_set():
+            body = self._too_costly(path, job, m)
+            if body is not None:
+                body["token"] = token
+                self.client.put_picture_area(kind, item_id, body)
+                log.info("backfill.too_costly", item_id=item_id, kind=kind, s=round(m.seconds))
+                return
         if m is None or m.interrupted:
             self.client.put_picture_area(
                 kind, item_id, {"released": True, "path": path, "token": token}
@@ -200,13 +214,35 @@ class PictureWorker:
         body["token"] = token
         self.client.put_picture_area(kind, item_id, body)
 
+    def _too_costly(
+        self, path: str, job: dict[str, Any], m: picture.Measurement
+    ) -> dict[str, Any] | None:
+        """The report of a title too costly to measure: what a probe of its
+        file says it is, the measurement's time and CPU, and why. None when
+        the worker stops meanwhile (the title is given back)."""
+        p = picture.measure(
+            path, job.get("durationMs"), deadline=time.time() + PROBE_S, stop=self.stop.is_set,
+            probe=True,
+        )  # fmt: skip
+        if p.interrupted:
+            return None
+        runs = int(job.get("costlyRuns") or 0) + 1
+        p.seconds, p.cpu_seconds = m.seconds, m.cpu_seconds
+        p.sampling = {**p.sampling, "doubt": ["cost"], "costlyRuns": runs}
+        if not p.error:
+            p.reason = (
+                f"can't tell: too costly to measure: {runs} runs of {round(m.seconds / 60)} min "
+                "each did not finish"
+            )
+        return p.report()
+
 
 def _pass_deadline() -> float:
     try:
         v = float(os.environ.get("PICTURE_PASS_DEADLINE_S") or PASS_DEADLINE_S)
     except ValueError:
         return PASS_DEADLINE_S
-    return min(max(v, 60.0), 6 * 3600.0)
+    return min(max(v, 60.0), 24 * 3600.0)
 
 
 def _time(v: Any) -> float | None:
