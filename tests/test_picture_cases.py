@@ -414,6 +414,17 @@ def test_an_interlaced_transport_stream_is_sampled_on_a_grid(media: Path) -> Non
     near(m, T239, ring=8)
 
 
+def test_a_film_in_a_transport_stream_is_sampled_on_a_grid(media: Path) -> None:
+    # An MPEG-TS has no index of its keyframes: the few points its probe
+    # finds are none, however far into the file they reach.
+    path = media / "film.ts"
+    if not path.exists():
+        src = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
+        ff("-i", str(src), "-c", "copy", "-f", "mpegts", str(path))
+    m = measure(path, 400_000)
+    assert m.sampling["mode"] == "grid" and m.area == FULL
+
+
 def test_a_rotated_video_cant_be_told(media: Path) -> None:
     flat, path = media / "phone-flat.mp4", media / "phone.mp4"
     if not path.exists():

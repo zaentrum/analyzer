@@ -18,8 +18,9 @@ What is sampled.
 
 Where from.
 
-  * an original whose container has an index (Matroska's cues, MP4's
-    sample table, AVI's index): its keyframes, a seek to each;
+  * an original whose container has an index of its keyframes (Matroska's
+    cues, MP4's sample table, AVI's index; none further apart than
+    INDEX_GAP_MAX_S): its keyframes, a seek to each;
   * an original without one (MPEG-TS, MPEG-PS): a grid of the same step, a
     seek to each time and the first keyframe from there;
   * a package's video rendition (its HLS playlist of fMP4 segments): its
@@ -27,8 +28,8 @@ Where from.
     the init segment's decoder configuration.
 
 What it costs. The keyframes are read coarse to fine, every 16th pick over
-the whole title first, then every 8th and every 4th, then the stretches,
-then the rest, each pass in the order of the file, until the read budget is
+the whole title first, then every 8th, then the stretches, then every 4th
+and the rest, each pass in the order of the file, until the read budget is
 spent: READ_MB_PER_HOUR of the title (PICTURE_READ_MB_PER_HOUR overrides
 it), at least READ_MIN_MB, besides what opening the file takes. A title
 whose keyframes are more than its budget keeps an even coverage, a coarser
@@ -63,12 +64,15 @@ READ_MB_PER_HOUR = 1024
 READ_MIN_MB = 96
 # The most keyframes a title takes: a longer one's are further apart.
 MAX_SAMPLES = 6000
+# A container's index lists the keyframes when none of its entries are
+# further apart than this (an MPEG-TS's is a few points its probe found).
+INDEX_GAP_MAX_S = 30.0
 # A grid sample reads at most this much to find a keyframe, a stretch this
 # much to decode through.
 GRID_READ_MAX = 48 << 20
 STRETCH_READ_MAX = 256 << 20
 # The keyframe passes before the stretches, and after them: every n-th pick.
-COARSE, FINE = (16, 8, 4), (2, 1)
+COARSE, FINE = (16, 8), (4, 2, 1)
 
 Sink = Callable[[float, Any, bool], None]
 
@@ -405,7 +409,10 @@ class Original(_Source):
             self._sequential(sink)
         else:
             self._keys = self._index()
-            covered = self._keys and self._keys[-1][0] >= 0.8 * sm.duration_s - 2 * TARGET_GAP_S
+            # an index of the keyframes, not of a few seek points: none
+            # further apart than INDEX_GAP_MAX_S over the whole title
+            times = [t for t, _ts in self._keys]
+            covered = len(times) >= 2 and _max_gap(times, sm.duration_s) <= INDEX_GAP_MAX_S
             self._v.codec_context.skip_frame = "NONKEY"
             if covered:
                 sm.mode = "keyframes"
