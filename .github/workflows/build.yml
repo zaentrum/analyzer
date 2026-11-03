@@ -23,8 +23,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      # the tests make their videos with ffmpeg (the measurement decodes
-      # with PyAV's own libraries)
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      # the tests make their videos with ffmpeg, and a Matroska file as
+      # mkvmerge writes one (the measurement decodes with PyAV's own
+      # libraries)
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix
       - run: pip install -e ".[dev]"
       - run: pytest -q
