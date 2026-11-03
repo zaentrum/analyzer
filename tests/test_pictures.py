@@ -140,7 +140,7 @@ def item(item_id: str = EPISODE, kind: str = "episode") -> ClaimedItem:
 def test_a_claims_titles_are_measured_and_reported_with_their_tokens(measured) -> None:
     catalog = Catalog([claim(FILM_JOB, EXTRA_JOB)])
     assert worker(catalog).claim_once() == 0  # titles were handed out: ask again at once
-    assert catalog.asked == [{"worker": "analyzer-0", "limit": 1, "method": "picture/2"}]
+    assert catalog.asked == [{"worker": "analyzer-0", "limit": 1, "method": "picture/3"}]
     deadline = datetime(2026, 11, 3, 17, 0, tzinfo=UTC).timestamp()
     assert measured == [
         (FILM_JOB["path"], 7_200_000, deadline),
@@ -153,7 +153,7 @@ def test_a_claims_titles_are_measured_and_reported_with_their_tokens(measured) -
     body = catalog.reports[0][1]
     assert body["area"] == {"x": 0, "y": 138, "width": 1920, "height": 804}
     assert body["frame"] == {"width": 1920, "height": 1080} and body["path"] == FILM_JOB["path"]
-    assert body["token"] == "token-of-the-film" and body["method"] == "picture/2"
+    assert body["token"] == "token-of-the-film" and body["method"] == "picture/3"
 
 
 def test_a_measurement_past_its_deadline_gives_its_title_back(measured) -> None:
@@ -221,9 +221,9 @@ def test_a_current_area_of_this_method_is_not_measured_again(measured, state) ->
 @pytest.mark.parametrize(
     "have",
     [
-        {"state": "measured", "current": False, "method": "picture/2"},
-        {"state": "measured", "current": True, "method": "picture/1"},
-        {"state": "failed", "current": True, "method": "picture/2"},
+        {"state": "measured", "current": False, "method": "picture/3"},
+        {"state": "measured", "current": True, "method": "picture/2"},
+        {"state": "failed", "current": True, "method": "picture/3"},
     ],
 )
 def test_an_area_of_another_file_or_method_is_measured_again(measured, have) -> None:

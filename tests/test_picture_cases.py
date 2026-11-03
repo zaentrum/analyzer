@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from analyzer.pipelines import picture
-from analyzer.pipelines.picture import Box
+from analyzer.pipelines.picture import Box, sources
 
 W, H = 320, 180
 # a 2.39:1 picture letterboxed in 16:9, and a 1.85:1 one
@@ -29,8 +29,9 @@ TOP, PIC = 24, 132
 T185, P185 = 4, 172
 T239 = Box(0, TOP, W, PIC)
 FULL = Box(0, 0, W, H)
-# what an encoder's ringing at a bright edge widens an area by, at most
-RING = 6
+# what an encoder's ringing at a bright edge widens an area by, at most: the
+# block (16 lines) the picture's edge cuts through
+RING = 8
 
 
 def _encoders() -> set[str]:
@@ -130,9 +131,10 @@ class Film:
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
             "-g", str(10 * self.fps), "-keyint_min", str(self.fps), "-pix_fmt", "yuv420p",
         ]  # fmt: skip
-        keys = ",".join(f"{t:.3f}" for t in self.starts)
-        ff("-filter_complex", ";".join([*graph, tail]), "-map", "[v]", *enc,
-           "-force_key_frames", keys, str(path))  # fmt: skip
+        keys = []
+        if self.starts:
+            keys = ["-force_key_frames", ",".join(f"{t:.3f}" for t in self.starts)]
+        ff("-filter_complex", ";".join([*graph, tail]), "-map", "[v]", *enc, *keys, str(path))
         return path
 
 
@@ -223,6 +225,42 @@ def test_a_long_film_samples_every_keyframe(media: Path) -> None:
     assert m.area == FULL and m.samples >= 240
 
 
+@pytest.mark.parametrize("gop", [4, 10])
+def test_a_shot_between_keyframes_far_apart_is_seen(media: Path, gop: int) -> None:
+    # A fixed group of pictures, no keyframe at the cuts (as a streaming
+    # encode): short 1.78 shots that hold no keyframe. The groups longer than
+    # 2.9 s are decoded through.
+    f = Film()
+    t = 0.0
+    for at, d in ((101.0, 3.0), (203.0, 4.0), (307.0, 6.0)):
+        f.wide(at - t).full(d)
+        t = at + d
+    f.wide(400 - t)
+    enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-g", str(2 * gop),
+           "-keyint_min", str(2 * gop), "-sc_threshold", "0", "-pix_fmt", "yuv420p"]  # fmt: skip
+    path = media / f"nokf{gop}.mkv"
+    if not path.exists():
+        f.starts = []  # no keyframe forced at the cuts
+        f.render(path, enc=enc)
+    m = measure(path, 400_000)
+    assert m.area == FULL and m.sampling["maxGapS"] <= 2.9
+
+
+@pytest.mark.skipif("libx265" not in ENCODERS, reason="no ffmpeg that encodes HEVC")
+def test_an_open_gop_film_with_its_keyframes_far_apart_is_seen(media: Path) -> None:
+    f = Film()
+    f.wide(101).full(4).wide(102).full(8).wide(185)
+    x265 = "keyint=50:min-keyint=2:scenecut=40:open-gop=1:log-level=error"
+    enc = ["-c:v", "libx265", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
+           "-x265-params", x265]  # fmt: skip
+    path = media / "opengop.mkv"
+    if not path.exists():
+        f.starts = []
+        f.render(path, enc=enc)
+    m = measure(path, 400_000)
+    assert m.area == FULL and m.sampling["maxGapS"] <= 2.9
+
+
 # ------------------------------------------------------- dark, grey, deep
 def test_a_night_film_keeps_its_dark_sky(media: Path) -> None:
     f = Film()
@@ -261,6 +299,37 @@ def test_full_range_video_has_its_bars_at_zero(media: Path) -> None:
     enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-g", "20",
            "-pix_fmt", "yuvj420p", "-color_range", "pc"]  # fmt: skip
     near(measure(f.render(media / "fullrange.mkv", enc=enc), 360_000), T239)
+
+
+def test_a_flat_grey_edge_of_a_wider_shot_keeps_the_frame(media: Path) -> None:
+    # A 20 s open-matte shot whose top and bottom bands are a flat dark grey
+    # (RGB 18: luma 31) in a film whose bars are black: the title's bar
+    # black (16) tells them from the bars, flat as they are.
+    f = Film()
+    n = len(f.parts)
+    f.wide(200)
+    f._add(
+        f"color=c=0x121212:s={W}x{TOP}:r=2:d=20[t{n}];color=c=0x121212:s={W}x{TOP}:r=2:d=20[u{n}];"
+        f"testsrc2=s={W}x{PIC}:r=2:d=20[m{n}];[t{n}][m{n}][u{n}]vstack=inputs=3",
+        20,
+    )
+    f.wide(180)
+    m = measure(f.render(media / "flatgrey.mkv"), 400_000)
+    assert m.area == FULL and m.sampling["blacks"]["top"] == pytest.approx(16, abs=1)
+
+
+def test_a_flat_grey_edge_of_a_wider_shot_keeps_a_pillarbox_frame(media: Path) -> None:
+    f = Film()
+    pil = f"pad={W}:{H}:40:0:black"
+    f._add(f"testsrc2=s=240x{H}:r=2:d=200,{f._noise()},{pil}", 200)
+    n = len(f.parts)
+    f._add(
+        f"color=c=0x121212:s=40x{H}:r=2:d=20[l{n}];color=c=0x121212:s=40x{H}:r=2:d=20[r{n}];"
+        f"testsrc2=s=240x{H}:r=2:d=20[m{n}];[l{n}][m{n}][r{n}]hstack=inputs=3",
+        20,
+    )
+    f._add(f"testsrc2=s=240x{H}:r=2:d=180,{f._noise()},{pil}", 180)
+    assert measure(f.render(media / "flatgrey-pillar.mkv"), 400_000).area == FULL
 
 
 def test_ten_bit_video_is_measured_as_eight(media: Path) -> None:
@@ -308,6 +377,25 @@ def test_a_logo_part_of_the_time_keeps_the_frame(media: Path) -> None:
     vf = "drawbox=x=284:y=6:w=26:h=10:color=white@0.9:t=fill:enable='lt(mod(t,100),40)'"
     m = measure(wide_film(media, "logo-40", 400, {}, vf=vf), 400_000)
     keeps(m, Box(0, 6, W, PIC + TOP - 6))
+    assert m.area == FULL
+
+
+def test_a_logo_that_moves_between_corners_is_no_logo(media: Path) -> None:
+    # (a drawbox's x is read once: two boxes, each on screen half the time)
+    box = "y=6:w=26:h=10:color=white@0.9:t=fill"
+    vf = (f"drawbox=x=10:{box}:enable='lt(mod(t,100),50)',"
+          f"drawbox=x=284:{box}:enable='gte(mod(t,100),50)'")  # fmt: skip
+    m = measure(wide_film(media, "logo-moving", 400, {}, vf=vf), 400_000)
+    keeps(m, Box(0, 6, W, PIC + TOP - 6))
+    assert m.area == FULL
+
+
+@pytest.mark.parametrize("y", [6, 160])
+def test_one_caption_in_a_bar_between_keyframes_is_seen(media: Path, y: int) -> None:
+    # One line of text, 4 s on screen, in a bar, between two keyframes 10 s
+    # apart and away from the stretches.
+    path = wide_film(media, f"caption-{y}", 400, {}, vf=glyphs(y, 141, 145, 120, 9))
+    m = measure(path, 400_000)
     assert m.area == FULL
 
 
@@ -428,7 +516,7 @@ def test_an_interlaced_dvd_program_stream_is_decoded_through(media: Path) -> Non
     near(m, Box(0, 36, 360, 216), ring=8)
 
 
-def test_an_interlaced_transport_stream_is_sampled_on_a_grid(media: Path) -> None:
+def test_an_interlaced_transport_stream_is_read_in_its_order(media: Path) -> None:
     path = media / "broadcast.ts"
     if not path.exists():
         ff("-f", "lavfi", "-i", f"testsrc2=s={W}x{PIC}:r=50:d=330",
@@ -436,12 +524,13 @@ def test_an_interlaced_transport_stream_is_sampled_on_a_grid(media: Path) -> Non
            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-flags", "+ildct+ilme",
            "-x264-params", "tff=1", "-g", "50", "-f", "mpegts", str(path))  # fmt: skip
     m = measure(path, 330_000)
-    assert m.sampling["mode"] == "grid" and m.sampling["maxGapS"] <= 6
+    assert m.sampling["mode"] == "stream" and m.sampling["maxGapS"] <= 2.9
+    assert m.bytes_read >= os.path.getsize(path)
     # interlaced coding rings further: its blocks are of field pairs
-    near(m, T239, ring=8)
+    near(m, T239, ring=16)
 
 
-def test_a_film_in_a_transport_stream_is_sampled_on_a_grid(media: Path) -> None:
+def test_a_film_in_a_transport_stream_is_read_in_its_order(media: Path) -> None:
     # An MPEG-TS has no index of its keyframes: the few points its probe
     # finds are none, however far into the file they reach.
     path = media / "film.ts"
@@ -449,7 +538,42 @@ def test_a_film_in_a_transport_stream_is_sampled_on_a_grid(media: Path) -> None:
         src = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
         ff("-i", str(src), "-c", "copy", "-f", "mpegts", str(path))
     m = measure(path, 400_000)
-    assert m.sampling["mode"] == "grid" and m.area == FULL
+    assert m.sampling["mode"] == "stream" and m.area == FULL and m.sampling["maxGapS"] <= 2.9
+
+
+def test_a_transport_stream_with_b_frames_is_read_from_its_first_keyframe(media: Path) -> None:
+    # Its first keyframe is decoded before its video's start time: the read
+    # in its order starts at it all the same, so its first 10 s are sampled.
+    path = media / "film-bframes.ts"
+    if not path.exists():
+        f = Film(fps=8)
+        f.wide(186).full(8).wide(206)
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-bf", "3", "-crf", "28",
+               "-g", "80", "-pix_fmt", "yuv420p"]  # fmt: skip
+        src = f.render(media / "film-bframes.mkv", enc=enc)
+        ff("-i", str(src), "-c", "copy", "-f", "mpegts", str(path))
+    m = measure(path, 400_000)
+    assert m.sampling["mode"] == "stream" and m.sampling["maxGapS"] <= 2.9, m.reason
+    assert m.area == FULL
+
+
+def test_an_mp4_with_b_frames_seeks_its_own_keyframes(media: Path) -> None:
+    # An MP4's index holds decoding times, before its frames' presentation
+    # times where they are reordered, and a seek to one lands on the
+    # keyframe before it. Its keyframes 2 s apart are each read all the same,
+    # none twice.
+    path = media / "film-bframes-gop2.mp4"
+    if not path.exists():
+        f = Film(fps=8)
+        f.wide(186).full(8).wide(206)
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-bf", "3", "-crf", "28",
+               "-g", "16", "-pix_fmt", "yuv420p"]  # fmt: skip
+        src = f.render(media / "film-bframes-gop2.mkv", enc=enc)
+        ff("-i", str(src), "-c", "copy", str(path))
+    m = measure(path, 400_000)
+    assert m.sampling["mode"] == "keyframes", m.reason
+    assert m.sampling["missed"] == 0 and m.sampling["duplicates"] == 0, m.reason
+    assert m.sampling["maxGapS"] <= 2.9 and m.area == FULL
 
 
 def test_a_rotated_video_cant_be_told(media: Path) -> None:
@@ -488,8 +612,89 @@ def test_fonts_in_a_matroska_file_are_read_once(media: Path) -> None:
     m = measure(path, 400_000)
     assert m.area == FULL
     opened, read = m.sampling["bytesOpen"], m.bytes_read
+    # the font is read once, as the file is opened; the video's groups of
+    # pictures of 10 s are decoded through
     assert 4 << 20 <= opened < 5 << 20
-    assert read - opened < 0.75 * os.path.getsize(plain), (opened, read)
+    assert read - opened < 2 * os.path.getsize(plain), (opened, read)
+
+
+def test_a_damaged_stretch_of_a_file_cant_be_told(media: Path) -> None:
+    # The bytes of the 1.78 sequence's packets zeroed: the seeks into it land
+    # on the next good keyframe, and its samples are missing, not wrong.
+    src = wide_film(media, "seq178-20", 400, {186: ("full", 20)})
+    path = media / "damaged.mkv"
+    if not path.exists():
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "packet=pts_time,pos,size", "-of", "csv=p=0", str(src)],
+            capture_output=True, text=True, check=True,
+        ).stdout  # fmt: skip
+        spans = []
+        for ln in probe.splitlines():
+            t, size, pos = [*ln.split(","), "", "", ""][:3]
+            if t and pos and 185 <= float(t) < 207:
+                spans.append((int(pos), int(pos) + int(size)))
+        data = bytearray(src.read_bytes())
+        lo, hi = min(a for a, _b in spans), max(b for _a, b in spans)
+        data[lo:hi] = bytes(hi - lo)
+        path.write_bytes(bytes(data))
+    m = picture.measure(str(path), 400_000)
+    assert m.area is None, m.sides
+    assert set(m.sampling.get("doubt") or ["error"]) & {"gap", "missed", "duplicates", "error"}
+
+
+def test_a_file_cut_short_cant_be_told(media: Path) -> None:
+    # Matroska writes its cues at its end: cut at 60 %, the file has none,
+    # and says it runs 400 s; what is left is read in its order.
+    src = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
+    path = media / "cut.mkv"
+    if not path.exists():
+        data = src.read_bytes()
+        path.write_bytes(data[: int(len(data) * 0.6)])
+    m = picture.measure(str(path), 400_000)
+    assert m.area is None and "gap" in (m.sampling.get("doubt") or []), (m.reason, m.error)
+
+
+def test_a_run_of_long_groups_of_pictures_reads_on(media: Path, monkeypatch) -> None:
+    # Every group of pictures of this film is longer than 2.9 s: one run
+    # decodes them all through, and its read limit is each group's, so a
+    # film far longer than the limit is read to its end.
+    path = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
+    monkeypatch.setattr(sources, "THROUGH_READ_MAX", path.stat().st_size // 8)
+    src = sources.Original(str(path), 400.0)
+    try:
+        sm = src.run(lambda t, frame, counted: None)
+    finally:
+        src.close()
+    assert sm.mode == "keyframes" and sm.stopped is None
+    assert sm.max_gap() <= sources.TARGET_GAP_S and max(sm.times) > 397
+
+
+def test_a_read_budget_reached_cant_be_told(media: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PICTURE_ORIGINAL_READ_MB_PER_HOUR", "16")
+    big = media / "budget.mkv"
+    if not big.exists():
+        ff("-f", "lavfi", "-i", f"testsrc2=s={W}x{PIC}:r=24:d=120", "-vf",
+           f"noise=alls=10:allf=t+u,pad={W}:{H}:0:{TOP}:black", "-c:v", "libx264", "-preset",
+           "ultrafast", "-crf", "16", "-g", "24", str(big))  # fmt: skip
+    assert big.stat().st_size > 8 << 20
+    m = picture.measure(str(big), 120_000)
+    assert m.area is None and m.sampling["doubt"][0] == "budget", m.reason
+
+
+@pytest.mark.skipif(shutil.which("mkvmerge") is None, reason="no mkvmerge")
+def test_a_file_mkvmerge_made_is_read_as_any(media: Path) -> None:
+    src = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
+    made, bare = media / "mkvmerge.mkv", media / "mkvmerge-nocues.mkv"
+    if not made.exists():
+        subprocess.run(["mkvmerge", "-q", "-o", str(made), str(src)], check=True)
+        subprocess.run(["mkvmerge", "-q", "--cues", "0:none", "-o", str(bare), str(src)],
+                       check=True)  # fmt: skip
+    m = measure(made, 400_000)
+    assert m.area == FULL and m.sampling["mode"] == "keyframes"
+    assert m.bytes_read < 2 * os.path.getsize(made)
+    m = measure(bare, 400_000)
+    assert m.area == FULL and m.sampling["mode"] == "stream"
 
 
 def package(src: Path, out: Path, *, copy: bool = True) -> Path:
@@ -511,15 +716,28 @@ def package(src: Path, out: Path, *, copy: bool = True) -> Path:
 
 
 def test_a_package_is_sampled_by_its_keyframes(media: Path) -> None:
-    src = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
+    # A rung copied of a source with a keyframe every 2 s: its sync samples
+    # leave no two more than 3 s apart.
+    f = Film()
+    f.wide(186).full(8).wide(206)
+    enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-g", "4",
+           "-pix_fmt", "yuv420p"]  # fmt: skip
+    src = f.render(media / "gop2.mkv", enc=enc)
     m = measure(package(src, media / "pkg-copy"), 400_000)
-    assert m.area == FULL and m.sampling["mode"] == "package" and m.measured_on["kind"] == "package"
-    logo = wide_film(
-        media, "logo", 400, {}, vf="drawbox=x=284:y=6:w=26:h=10:color=white@0.9:t=fill"
-    )
-    m = measure(package(logo, media / "pkg-encoded", copy=False), 400_000)
-    near(m, T239)
-    assert m.sampling["maxGapS"] <= 6.5
+    assert m.area == FULL, m.reason
+    assert m.sampling["mode"] == "package" and m.measured_on["kind"] == "package"
+    assert m.sampling["maxGapS"] <= 2.9
+
+
+def test_a_package_with_a_keyframe_every_6_s_cant_tell(media: Path) -> None:
+    # An encoder's rung: an IDR every 6 s, none at a cut. A shot of 3 s
+    # between two of them has no sample: the measurement can't tell.
+    vf = "drawbox=x=284:y=6:w=26:h=10:color=white@0.9:t=fill"
+    pkg = package(wide_film(media, "logo", 400, {}, vf=vf), media / "pkg-encoded", copy=False)
+    m = measure(pkg, 400_000)
+    assert m.area is None
+    assert m.reason.startswith("can't tell: its samples are up to 6.0 s apart"), m.reason
+    assert m.sampling["doubt"] == ["gap"]
 
 
 def test_a_short_package_is_decoded_through(media: Path) -> None:
@@ -547,7 +765,7 @@ def test_a_measurement_reports_what_it_measured_and_what_it_cost(media: Path) ->
     path = wide_film(media, "seq178-8", 400, {186: ("full", 8)})
     m = measure(path, 400_000)
     r = m.report()
-    assert r["method"] == "picture/2" and r["measuredOn"]["kind"] == "original"
+    assert r["method"] == "picture/3" and r["measuredOn"]["kind"] == "original"
     assert r["measuredOn"]["size"] == os.path.getsize(path)
     assert r["bytesRead"] > 0 and r["cpuSeconds"] >= 0 and r["sampling"]["stretches"] == 12
     assert r["decoder"].startswith("av ") and r["video"]["codec"] == "h264"

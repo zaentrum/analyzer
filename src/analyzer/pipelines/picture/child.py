@@ -3,6 +3,13 @@ PATH [DURATION_MS] measures the video at path and writes the result, one
 line of JSON, to stdout. The parent (measure.py) runs it at a lower
 priority, kills it at its deadline, and reads its CPU and its memory when it
 reaps it; whatever the decoder does, it can't hold the worker up.
+
+A measurement never says an area while it is in doubt: it says it can't
+tell (reason; sampling.doubt names why) when its samples are more than
+MAX_GAP_S apart anywhere in the title, when the read budget stopped it,
+when a seek decoded another frame than the keyframe it sought, or when a
+frame was decoded twice where another was due. The players then fit the
+whole frame, as without an area.
 """
 
 from __future__ import annotations
@@ -21,6 +28,8 @@ NICE = 10
 # Samples that may fail, as a share of those tried (and at least one), for
 # a measurement still to say anything.
 FAIL_SHARE = 0.03
+# No two samples further apart than this, the title's start and end too.
+MAX_GAP_S = 3.0
 
 
 def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
@@ -52,7 +61,7 @@ def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
 
     def sink(t: float, frame: Any, counted: bool) -> None:
         nonlocal acc
-        r = planes.reduce_frame(frame)
+        r = planes.reduce_frame(frame, src.blacks)
         if acc is None:
             acc = rules.Accumulator(r.width, r.height)
         acc.add(r, t, counted)
@@ -69,6 +78,7 @@ def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
             src.close()
     sm = sm or src.sampling
     out["sampling"] = _sampling(sm)
+    out["sampling"]["blacks"] = dict(src.blacks)
     out["frame"] = {"width": src.video.width, "height": src.video.height}
     out["seconds"] = round(time.monotonic() - t0, 2)
     if "reason" in out or "error" in out:
@@ -89,11 +99,43 @@ def run(path: str, duration_ms: int | None = None) -> dict[str, Any]:
     d = acc.decide()
     out["samples"], out["informative"] = d.samples, d.informative
     out["sides"] = d.sides
+    out["reason"] = d.reason
+    codes, why = doubts(sm)
+    out["sampling"]["doubt"] = codes
+    if codes:
+        out["reason"] = "can't tell: " + "; ".join(why)
+        return out
     if d.area is not None:
         a = d.area
         out["area"] = {"x": a.x, "y": a.y, "width": a.width, "height": a.height}
-    out["reason"] = d.reason
     return out
+
+
+def doubts(sm: sources.Sampling) -> tuple[list[str], list[str]]:
+    """What leaves a measurement in doubt: codes (gap, budget, missed,
+    duplicates) and why."""
+    codes: list[str] = []
+    why: list[str] = []
+    if sm.stopped:
+        codes.append("budget")
+        why.append(f"the reads stopped ({sm.stopped}) after {sm.bytes_read / 2**20:.0f} MiB")
+    gap = sm.largest_gap()
+    if gap is None:
+        codes.append("gap")
+        why.append("no sample was taken")
+    elif gap[0] > MAX_GAP_S:
+        codes.append("gap")
+        why.append(
+            f"its samples are up to {gap[0]:.1f} s apart (from {gap[1]:.1f} s), "
+            f"more than {MAX_GAP_S:g} s"
+        )
+    if sm.missed:
+        codes.append("missed")
+        why.append(f"{sm.missed} seeks decoded another frame than the keyframe they sought")
+    if sm.duplicates:
+        codes.append("duplicates")
+        why.append(f"{sm.duplicates} samples decoded a frame taken already")
+    return codes, why
 
 
 def decoder() -> str:
@@ -127,8 +169,10 @@ def _sampling(sm: sources.Sampling) -> dict[str, Any]:
         "attempted": sm.attempted,
         "decoded": sm.decoded,
         "failed": sm.failed,
+        "missed": sm.missed,
         "duplicates": sm.duplicates,
         "stretches": sm.stretches,
+        "calibration": sm.calibration,
         "maxGapS": None if gap is None else round(gap, 2),
         "bytesOpen": sm.bytes_open,
         "bytesRead": sm.bytes_read,

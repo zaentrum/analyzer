@@ -21,7 +21,7 @@ from .rules import Box
 log = structlog.get_logger(__name__)
 
 # The measurement's version, kept with every area.
-METHOD = "picture/2"
+METHOD = "picture/3"
 # A measurement without a deadline of its own stops after this long.
 MAX_SECONDS = 3600.0
 # How often the parent looks at its deadline, and at stop.

@@ -71,8 +71,17 @@ def yuv(
     return tuple(np.clip(np.rint(p), 0, 255).astype(np.uint8) for p in (y, u, v))
 
 
-def reduced(**kw) -> planes.Reduced:
-    return planes.reduce_planes(*yuv(**kw), 8)
+# the title's bar black of a frame whose bars are at 16, each side
+BLACKS: planes.Blacks = dict.fromkeys(planes.SIDES, 16.0)
+
+
+def reduced(blacks: planes.Blacks | None = None, **kw) -> planes.Reduced:
+    return planes.reduce_planes(*yuv(**kw), 8, BLACKS if blacks is None else blacks)
+
+
+def calibrated(n: int = 24, **kw) -> planes.Blacks:
+    """The bar blacks calibrate() reads off n frames drawn so."""
+    return planes.calibrate([planes.edges(*yuv(seed=i, **kw), 8) for i in range(n)])
 
 
 def decide(*samples: planes.Reduced | tuple[planes.Reduced, bool]) -> rules.Decision:
@@ -83,8 +92,8 @@ def decide(*samples: planes.Reduced | tuple[planes.Reduced, bool]) -> rules.Deci
     return acc.decide()
 
 
-def letterboxed(n: int = 40, **kw) -> list[planes.Reduced]:
-    return [reduced(seed=i, **kw) for i in range(n)]
+def letterboxed(n: int = 40, blacks: planes.Blacks | None = None, **kw) -> list[planes.Reduced]:
+    return [reduced(blacks, seed=i, **kw) for i in range(n)]
 
 
 def test_a_letterbox_is_its_picture() -> None:
@@ -94,16 +103,23 @@ def test_a_letterbox_is_its_picture() -> None:
 
 
 def test_a_full_frame_is_the_frame() -> None:
-    d = decide(*letterboxed(top=0, height=H))
+    blacks = calibrated(top=0, height=H)
+    assert blacks == dict.fromkeys(planes.SIDES)
+    d = decide(*letterboxed(top=0, height=H, blacks=blacks))
     assert d.area == FULL
-    assert d.sides["top"]["note"] == "the frame's edge is never black"
+    assert d.sides["top"]["note"] == "the title's edges on this side hold no black"
 
 
 def test_black_dark_and_faded_frames_add_nothing() -> None:
     black = [reduced(height=0, seed=i) for i in range(10)]
-    grey = [reduced(height=0, fill=(30, 128, 128), seed=i) for i in range(10)]
+    faded = [reduced(height=0, black=17, seed=i) for i in range(10)]
     dark = [reduced(level=24, seed=i) for i in range(10)]
-    assert decide(*letterboxed(), *black, *grey, *dark).area == LETTERBOX
+    assert decide(*letterboxed(), *black, *faded, *dark).area == LETTERBOX
+    # A frame faded to a grey over its bars too is no black there: flat as
+    # it is, it is told from the bars' black, as an open matte shot's grey
+    # sky is.
+    grey = [reduced(height=0, fill=(30, 128, 128), seed=i) for i in range(10)]
+    assert decide(*letterboxed(), *grey).area == FULL
 
 
 def test_a_wider_shot_few_samples_show_keeps_the_axis_whole() -> None:
@@ -169,7 +185,7 @@ def test_ten_bit_planes_read_as_eight() -> None:
     acc = rules.Accumulator(W, H)
     for i in range(40):
         y, u, v = (p.astype(np.uint16) * 4 for p in yuv(seed=i))
-        acc.add(planes.reduce_planes(y, u, v, 10), float(i))
+        acc.add(planes.reduce_planes(y, u, v, 10, BLACKS), float(i))
     assert acc.decide().area == LETTERBOX
 
 
@@ -189,9 +205,15 @@ def test_a_mark_in_the_middle_of_a_bar_is_no_logo() -> None:
     assert d.area == FULL
 
 
-def test_a_mark_in_fewer_than_half_the_samples_is_no_logo() -> None:
+def test_a_mark_in_fewer_than_most_samples_is_no_logo() -> None:
     logo = ((280, 6, 28, 10, 230),)
-    d = decide(*letterboxed(16, marks=logo), *letterboxed(24))
+    d = decide(*letterboxed(28, marks=logo), *letterboxed(12))
+    assert d.area == FULL
+
+
+def test_a_mark_that_moves_between_corners_is_no_logo() -> None:
+    left, right = ((12, 6, 28, 10, 230),), ((280, 6, 28, 10, 230),)
+    d = decide(*letterboxed(20, marks=left), *letterboxed(20, marks=right))
     assert d.area == FULL
 
 
@@ -246,8 +268,37 @@ def test_too_few_samples_with_a_picture_say_so() -> None:
 
 
 def test_an_edge_that_is_never_black_has_no_bar() -> None:
-    d = decide(*letterboxed(black=60))
-    assert d.area == FULL and d.sides["top"]["note"] == "the frame's edge is never black"
+    blacks = calibrated(black=60)
+    assert blacks["top"] is None and blacks["bottom"] is None
+    d = decide(*letterboxed(black=60, blacks=blacks))
+    assert d.area == FULL
+    assert d.sides["top"]["note"] == "the title's edges on this side hold no black"
+
+
+def test_the_bar_black_is_the_titles() -> None:
+    # Most frames' edges are the bars' black: the median of the edges of the
+    # frames read; a coloured edge is no black.
+    seen = [planes.edges(*yuv(seed=i), 8) for i in range(20)]
+    seen += [planes.edges(*yuv(seed=i, top=0, height=H), 8) for i in range(4)]
+    assert planes.calibrate(seen)["top"] == 16.0
+    blue = [planes.edges(*yuv(seed=i, fill=(22, 172, 124), height=0), 8) for i in range(9)]
+    assert planes.calibrate(blue)["top"] is None
+
+
+def test_a_flat_grey_edge_of_a_wider_shot_is_picture() -> None:
+    # An open-matte shot whose top and bottom rows are a flat dark grey (RGB
+    # 18: luma 31) in a film whose bars are black (16): those rows lie 15
+    # levels from the title's bar black, picture, though they are flat.
+    grey = [
+        reduced(seed=i, top=0, height=H, fill=(31, 128, 128), marks=((0, TOP, W, PIC, 120),))
+        for i in range(8)
+    ]
+    assert decide(*letterboxed(), *grey).area == FULL
+    pillar = [
+        reduced(seed=i, top=0, height=H, fill=(31, 128, 128), marks=((40, 0, 240, H, 120),))
+        for i in range(8)
+    ]
+    assert decide(*letterboxed(top=0, height=H, left=40, width=240), *pillar).area == FULL
 
 
 def test_the_counts_take_the_same_memory_for_any_number_of_samples() -> None:
@@ -255,7 +306,7 @@ def test_the_counts_take_the_same_memory_for_any_number_of_samples() -> None:
     y = np.full((big_h, big_w), 16, np.uint16) * 4
     y[276:1884] = 400
     u = np.full((big_h // 2, big_w // 2), 512, np.uint16)
-    r = planes.reduce_planes(y, u, u.copy(), 10)
+    r = planes.reduce_planes(y, u, u.copy(), 10, BLACKS)
     acc = rules.Accumulator(big_w, big_h)
     acc.add(r, 0.0)
     tracemalloc.start()
@@ -276,6 +327,61 @@ def test_keyframes_are_picked_no_further_apart_than_the_gap() -> None:
     every = [k * 0.5 for k in range(100)]
     got = [every[i] for i in sources.cover(every, 2.9)]
     assert max(b - a for a, b in itertools.pairwise(got)) == 2.5
+
+
+def test_an_originals_keyframes_are_all_taken_but_those_too_close() -> None:
+    times = [0.0, 0.04, 0.5, 1.0, 1.2, 1.6, 9.0]
+    assert [times[i] for i in sources.thin(times, 0.5)] == [0.0, 0.5, 1.0, 1.6, 9.0]
+
+
+class _Collect:
+    """A source's _take as a list of the times taken."""
+
+    def __init__(self) -> None:
+        self.taken: list[float] = []
+
+    def _take(self, frame, t, sink, counted) -> bool:
+        if t in self.taken:
+            return False
+        self.taken.append(t)
+        return True
+
+
+def test_a_run_decoded_through_leaves_no_two_samples_further_apart_than_its_step() -> None:
+    # frames every 0.12 s (the reference frames of a group of pictures) from
+    # a keyframe at 10 s to the next at 22.5 s
+    src = _Collect()
+    taker = sources._Taker(src, None, True)
+    t = 10.0
+    while t < 22.5:
+        taker.frame(round(t, 2), None, 2.9)
+        t += 0.12
+    taker.close_at(22.5, 2.9)
+    got = [*src.taken, 22.5]
+    assert got[0] == 10.0
+    assert max(b - a for a, b in itertools.pairwise(got)) <= 2.9
+    assert len(src.taken) == 5
+
+
+def test_the_largest_gap_is_between_the_frames_decoded_and_the_ends() -> None:
+    sm = sources.Sampling(duration_s=100.0, times=[0.0, 2.0, 4.5, 40.0, 41.0, 43.0, 99.5])
+    assert sm.largest_gap() == (56.5, 43.0)
+    sm = sources.Sampling(duration_s=100.0, times=[5.0, 7.0, 9.0])
+    assert sm.largest_gap() == (91.0, 9.0)
+    sm = sources.Sampling(duration_s=100.0, times=[1.0, 3.0, 60.0])
+    assert sm.largest_gap() == (57.0, 3.0)
+    assert sources.Sampling(duration_s=10.0, times=[1.0, 3.0]).largest_gap() == (7.0, 3.0)
+
+
+def test_a_measurement_in_doubt_says_why() -> None:
+    dense = [k * 2.5 for k in range(41)]
+    assert child.doubts(sources.Sampling(duration_s=100.0, times=dense)) == ([], [])
+    codes, why = child.doubts(
+        sources.Sampling(duration_s=100.0, times=[k * 6.0 for k in range(17)], missed=2,
+                         duplicates=1, stopped="budget", bytes_read=300 << 20)
+    )  # fmt: skip
+    assert codes == ["budget", "gap", "missed", "duplicates"]
+    assert why[1] == "its samples are up to 6.0 s apart (from 0.0 s), more than 3 s"
 
 
 def test_the_picks_go_coarse_to_fine_each_pass_in_order() -> None:
@@ -390,7 +496,8 @@ def test_a_measurement_that_saw_its_file_change_says_nothing(monkeypatch, tmp_pa
 
     class Source:
         video = sources.Video("h264", W, H)
-        sampling = sources.Sampling(mode="keyframes", duration_s=600)
+        sampling = sources.Sampling(mode="keyframes", duration_s=40)
+        blacks = BLACKS
 
         def run(self, sink):
             for i in range(40):
@@ -399,7 +506,7 @@ def test_a_measurement_that_saw_its_file_change_says_nothing(monkeypatch, tmp_pa
 
     monkeypatch.setattr(sources, "identity", identity)
     monkeypatch.setattr(sources, "open_source", lambda *_a: Source())
-    monkeypatch.setattr(planes, "reduce_frame", lambda f: reduced(seed=f.seed))
+    monkeypatch.setattr(planes, "reduce_frame", lambda f, blacks: reduced(blacks, seed=f.seed))
     out = child.run(str(tmp_path / "film.mkv"), 600_000)
     assert out["error"] == "the file changed while it was measured" and "area" not in out
 
@@ -412,7 +519,8 @@ class _Frame:
 def test_a_measurement_whose_samples_fail_says_why(monkeypatch, tmp_path) -> None:
     class Source:
         video = sources.Video("h264", W, H)
-        sampling = sources.Sampling(mode="keyframes", duration_s=600)
+        sampling = sources.Sampling(mode="keyframes", duration_s=40)
+        blacks = BLACKS
 
         def run(self, sink):
             for i in range(40):
@@ -425,7 +533,7 @@ def test_a_measurement_whose_samples_fail_says_why(monkeypatch, tmp_path) -> Non
 
     monkeypatch.setattr(sources, "identity", lambda paths: [None])
     monkeypatch.setattr(sources, "open_source", lambda *_a: Source())
-    monkeypatch.setattr(planes, "reduce_frame", lambda f: reduced(seed=f.seed))
+    monkeypatch.setattr(planes, "reduce_frame", lambda f, blacks: reduced(blacks, seed=f.seed))
     out = child.run(str(tmp_path / "film.mkv"), 600_000)
     assert out["error"].startswith("4 of 40 samples failed, more than 1") and "area" not in out
 
@@ -450,7 +558,7 @@ def test_the_process_says_what_it_could_not_read(tmp_path: Path) -> None:
     m = picture.measure(str(bad), 60_000)
     assert m.area is None and m.error and m.error.startswith("the file can't be opened")
     assert m.cpu_seconds > 0 and m.max_rss_bytes > 0
-    assert m.report()["method"] == picture.METHOD == "picture/2"
+    assert m.report()["method"] == picture.METHOD == "picture/3"
 
 
 def test_the_decoder_is_named(tmp_path: Path) -> None:

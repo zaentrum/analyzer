@@ -4,12 +4,12 @@ Each sample is reduced (planes.py) and added to an Accumulator as it is
 decoded; of a sample only counts are kept, so the memory is the same for
 ten samples and for ten thousand.
 
-A line of a side's zone is bar in a sample when it lies at the black of
-that side's outermost line: its mean within LEVEL levels of it, no segment
-more than DIM levels of luma, or CHROMA_DIM of chroma, away from it
-(planes.py), and that black a black (its luma at most BLACK_MAX, its chroma
-within BLACK_CHROMA of neutral). A sample's picture on a side starts at its
-first line that is not bar. Then, per side:
+A line of a side's zone is bar in a sample when it lies at the title's bar
+black of that side (planes.py, read from frames spread over the title, not
+from the sample's own edge): its mean within LEVEL levels of it, and no
+segment more than DIM levels of luma, or CHROMA_DIM of chroma, away from it.
+A side with no bar black has no bar line. A sample's picture on a side
+starts at its first line that is not bar. Then, per side:
 
   * the edge is the outermost first line of any sample: the picture's union
     over the samples, so a black frame, a dark scene or a fade adds nothing,
@@ -17,10 +17,11 @@ first line that is not bar. Then, per side:
   * a logo is left out: a mark in a corner of the bar (not in the middle
     three fifths of the line), in at least LOGO_SHARE of the samples, at the
     same place in the same shape (nothing else is ever in that corner of
-    the bar but the mark and what touches it);
+    the bar but the mark and what touches it): a mark that moves between
+    corners is in neither long enough;
   * the bar's edge is where enough samples show the picture reaching it
     (SUPPORT_MIN, and SUPPORT_SHARE of those that show a picture, within a
-    few lines; the samples of a stretch decoded through count as one); a
+    few lines; the samples of a stretch decoded through are no support); a
     union edge up to NEAR lines beyond it, which few samples show (ringing
     at a bright edge, a blocky frame), widens the area to take it in, and
     one further out is another picture than the one most samples show (a
@@ -46,12 +47,9 @@ import numpy as np
 
 from .planes import CORNER, SEGMENTS, SIDES, Reduced, zone
 
-# A bar's line: its mean within LEVEL levels (8 bits) of the black of the
-# side's outermost line, whose luma is at most BLACK_MAX and whose chroma
-# lies within BLACK_CHROMA of neutral.
+# A bar's line: its mean within LEVEL levels (8 bits) of the title's bar
+# black of its side.
 LEVEL = 2.0
-BLACK_MAX = 40.0
-BLACK_CHROMA = 8.0
 # Samples, and the share of those that show a picture, that must show the
 # picture reaching an edge (within SUPPORT_TOLERANCE of the side's length,
 # at least 2 lines) for it to be the bar's.
@@ -70,7 +68,7 @@ SYMMETRY_MIN = 4
 # the ringing around it) is within LOGO_MARGIN of the side's length of it
 # along the side's lines (at least LOGO_MARGIN_MIN lines), and a segment
 # across them.
-LOGO_SHARE = 0.5
+LOGO_SHARE = 0.8
 LOGO_MARGIN = 0.01
 LOGO_MARGIN_MIN = 8
 # Samples that must show a picture: MIN_INFORMATIVE, and INFORMATIVE_SHARE
@@ -143,22 +141,21 @@ class _Side:
         self.center = _Hist(self.z)
         # Per line and segment, how many samples hold something there.
         self.cells = np.zeros((self.z, SEGMENTS), np.int64)
-        self.bright = 0
-        self.black_min = math.inf
-        self.black_max = -math.inf
+        self.black: float | None = None
 
     def add(self, lines: Any, t: float | None, counted: bool) -> None:
         z = self.z
-        bright = lines.black > BLACK_MAX or lines.black_chroma > BLACK_CHROMA
-        if bright:
-            self.bright += 1
-        self.black_min = min(self.black_min, lines.black)
-        self.black_max = max(self.black_max, lines.black)
+        self.black = lines.black
+        if lines.black is None:
+            # no bar black: the side's lines are all picture
+            self.strict.add(0, counted, t)
+            self.center.add(0, counted, t)
+            return
         dim = lines.dim
         strict = (dim != 0) | (lines.dev_full > LEVEL)
         center = ((dim & _CENTER) != 0) | (lines.dev_center > LEVEL)
-        fs = 0 if bright else _first(strict, z)
-        fc = 0 if bright else _first(center, z)
+        fs = _first(strict, z)
+        fc = _first(center, z)
         self.strict.add(fs, counted, t)
         self.center.add(fc, counted, t)
         # the cells of the lines before the picture (by the middle) only:
@@ -214,8 +211,7 @@ class Accumulator:
             )
         for a, b in _AXES:
             _pair(found, bars, sides, a, b, h if a == "top" else w)
-        blacks = [v for s in self.sides.values() for v in (s.black_min, s.black_max)]
-        sides["black"] = {"min": round(min(blacks), 1), "max": round(max(blacks), 1)} if n else None
+        sides["black"] = {name: s.black for name, s in self.sides.items()}
         need = max(MIN_INFORMATIVE, math.ceil(INFORMATIVE_SHARE * max(self.counted, 1)))
         if self.counted_informative < need:
             why = (
@@ -253,8 +249,8 @@ def _edge(s: _Side, n: int, informative: int) -> tuple[int, int, dict[str, Any]]
         why["at"] = round(hist.at[1], 1)
     if union == 0:
         why["note"] = (
-            "the frame's edge is never black"
-            if s.bright == n
+            "the title's edges on this side hold no black"
+            if s.black is None
             else "the picture reaches the frame's edge"
         )
         return 0, 0, why
