@@ -19,7 +19,7 @@ import httpx
 import pytest
 from structlog.testing import capture_logs
 
-from analyzer import kafka, worker
+from analyzer import kafka, pictures, worker
 from analyzer.katalog import KatalogClient
 from analyzer.pipelines import blackframe, chapters, chromaprint, picture, silence, subtitles, tidb
 
@@ -90,14 +90,10 @@ class Catalog:
     """The catalog's worker protocol. Step writes update the statuses the
     next read returns, as the real one does."""
 
-    def __init__(self, path: Path, steps: dict[str, str], *, siblings: bool | str = False,
-                 picture: dict | None = None) -> None:
+    def __init__(self, path: Path, steps: dict[str, str], *, siblings: bool | str = False) -> None:
         self.path = path
         self.steps = dict(steps)
         self.siblings = siblings
-        # The item's picture area as GET /api/picture/items/{id} answers it
-        # (None: 404, it has none).
-        self.picture = picture
         self.writes: list[tuple[str, str, object]] = []
 
     def detail(self, item_id: str) -> dict:
@@ -127,9 +123,7 @@ class Catalog:
         if request.method == "GET" and path == f"/api/analyze/items/{ITEM}/steps":
             return httpx.Response(200, json={"itemId": ITEM, "steps": self.steps})
         if request.method == "GET" and path == f"/api/picture/items/{ITEM}":
-            if self.picture is None:
-                return httpx.Response(404, text="no picture area")
-            return httpx.Response(200, json=self.picture)
+            return httpx.Response(404, text="no picture area")
         if request.method == "GET" and path == f"/api/analyze/items/{ITEM}/siblings":
             if self.siblings == "error":
                 return httpx.Response(503, text="catalog busy")
@@ -151,11 +145,14 @@ class Detectors:
         self.found = {"tidb": [INTRO], "subtitle": [RECAP], "blackframe": [CREDITS],
                       "silence": [], "chromaprint": [THEME], **found}
         self.slow = slow or {}
-        # The picture area measured, apart from the passes: what it was
-        # asked to measure.
+        # The picture areas measured, on the picture worker's thread: what
+        # it was asked to measure; a measurement holds while hold is clear.
         self.pictures: list[str] = []
+        self.hold = threading.Event()
+        self.hold.set()
 
         def measure(path: str, *_args: object, **_kwargs: object) -> picture.Measurement:
+            self.hold.wait(10)
             self.pictures.append(path)
             return picture.Measurement(path=path, frame=picture.Box(0, 0, 1920, 1080),
                                        area=picture.Box(0, 138, 1920, 804), samples=240,
@@ -190,7 +187,8 @@ def retry() -> dict:
     return event(status="retry", source="retry")
 
 
-def run(monkeypatch: pytest.MonkeyPatch, catalog: Catalog, events: list[dict]) -> Broker:
+def run(monkeypatch: pytest.MonkeyPatch, catalog: Catalog, events: list[dict],
+        pictures=None) -> Broker:
     stop = threading.Event()
     broker = Broker(events, stop)
     monkeypatch.setattr(kafka, "build_consumer", lambda *a, **k: broker)
@@ -199,7 +197,7 @@ def run(monkeypatch: pytest.MonkeyPatch, catalog: Catalog, events: list[dict]) -
     client._http = httpx.Client(transport=httpx.MockTransport(catalog))
     worker.run_event_consumer(client, "broker.test:9092", "analyzer-workers",
                               "stube.catalog.item.enriched", "stube.catalog.item.analyzed",
-                              "PLAINTEXT", "transcode", 0.0, stop)
+                              "PLAINTEXT", "transcode", 0.0, stop, pictures)
     return broker
 
 
@@ -370,68 +368,96 @@ def test_retry_marker() -> None:
 
 
 # ------------------------------------------------------------ picture area
-def test_a_pass_measures_the_picture_area_and_reports_it(monkeypatch, media) -> None:
-    # Once the transcoder has its event: the measurement holds nothing up.
+class Handed:
+    """The picture worker's submit, as the consumer sees it: what it was
+    handed, and how far the item was then (events sent, offsets committed)."""
+
+    def __init__(self, broker: list) -> None:
+        self.items: list[tuple[str, int, list[int]]] = []
+        self.broker = broker
+
+    def __call__(self, item) -> bool:
+        b = self.broker[0]
+        self.items.append((item.id, len(b.produced), list(b.committed)))
+        return True
+
+
+def handed(monkeypatch: pytest.MonkeyPatch, catalog: Catalog, events: list[dict]) -> Handed:
+    seen: list = []
+    h = Handed(seen)
+    real = Broker.__init__
+
+    def init(self, *a, **k) -> None:
+        real(self, *a, **k)
+        seen.append(self)
+
+    monkeypatch.setattr(Broker, "__init__", init)
+    run(monkeypatch, catalog, events, pictures=h)
+    return h
+
+
+def test_a_pass_hands_its_title_to_the_picture_worker_once_it_is_sent(monkeypatch, media) -> None:
+    # Once the transcoder has its event and the offset is committed: the
+    # picture area holds nothing up.
     catalog = Catalog(media, {})
-    found = Detectors(monkeypatch)
-    broker = run(monkeypatch, catalog, [event()])
-    assert found.pictures == [str(media)]
-    [body] = catalog.picture_writes()
-    assert body["frame"] == {"width": 1920, "height": 1080}
-    assert body["area"] == {"x": 0, "y": 138, "width": 1920, "height": 804}
-    assert body["path"] == str(media) and body["method"] == picture.METHOD
-    assert [t for t, _e in broker.produced] == ["stube.catalog.item.analyzed"]
+    Detectors(monkeypatch)
+    h = handed(monkeypatch, catalog, [event()])
+    assert h.items == [(ITEM, 1, [0])]
     # The picture area is no step: the passes' steps are as they were.
     assert {step for step, _status in catalog.step_writes()} == {"tidb", "chapter", "subtitle",
                                                                  "blackframe", "silence"}
 
 
-@pytest.mark.parametrize("state", ["measured", "unknown"])
-def test_a_current_picture_area_is_not_measured_again(monkeypatch, media, state) -> None:
-    catalog = Catalog(media, {}, picture={"state": state, "current": True})
+def test_an_item_analyzed_already_is_handed_over_all_the_same(monkeypatch, media) -> None:
+    # Its file may have changed since (a new original): the picture worker
+    # asks the catalog whether its area is of what it plays now.
+    catalog = Catalog(media, DONE)
     found = Detectors(monkeypatch)
-    run(monkeypatch, catalog, [event()])
-    assert found.pictures == [] and catalog.picture_writes() == []
+    h = handed(monkeypatch, catalog, [event()])
+    assert found.calls == [] and [i for i, _p, _c in h.items] == [ITEM]
 
 
-def test_a_picture_area_of_another_file_is_measured_again(monkeypatch, media) -> None:
-    # The title's file changed since (a new original): the area is not of
-    # what it plays now. An item analyzed already runs no pass again, and
-    # its picture area is measured all the same.
-    catalog = Catalog(media, DONE, picture={"state": "measured", "current": False})
-    found = Detectors(monkeypatch)
-    run(monkeypatch, catalog, [event()])
-    assert found.calls == []
-    assert found.pictures == [str(media)] and len(catalog.picture_writes()) == 1
-
-
-def test_a_retry_measures_no_picture_area(monkeypatch, media) -> None:
+def test_a_retry_hands_nothing_over(monkeypatch, media) -> None:
     catalog = Catalog(media, {**DONE, "blackframe": "pending"})
-    found = Detectors(monkeypatch)
-    run(monkeypatch, catalog, [retry()])
-    assert found.pictures == []
+    Detectors(monkeypatch)
+    assert handed(monkeypatch, catalog, [retry()]).items == []
 
 
-def test_a_picture_area_that_fails_never_fails_the_item(monkeypatch, media) -> None:
+def test_a_hand_over_that_fails_never_fails_the_item(monkeypatch, media) -> None:
     catalog = Catalog(media, {})
     Detectors(monkeypatch)
 
-    def broken(*_args: object, **_kwargs: object) -> picture.Measurement:
-        raise RuntimeError("ffprobe vanished")
+    def broken(_item) -> bool:
+        raise RuntimeError("the picture worker is gone")
 
-    monkeypatch.setattr(picture, "measure", broken)
-    broker = run(monkeypatch, catalog, [event()])
-    assert catalog.picture_writes() == []
+    broker = run(monkeypatch, catalog, [event()], pictures=broken)
     assert not any(path.endswith("/fail") for _m, path, _b in catalog.writes)
     assert broker.committed == [0]
 
 
-def test_a_picture_area_is_off_by_the_environment(monkeypatch, media) -> None:
-    monkeypatch.setenv("PICTURE_AREA", "false")
+def test_a_measurement_never_holds_the_next_title_up(monkeypatch, media) -> None:
+    # The picture worker measures on its own thread: while a measurement
+    # runs, the consumer goes on with the next messages.
     catalog = Catalog(media, {})
     found = Detectors(monkeypatch)
-    run(monkeypatch, catalog, [event()])
-    assert found.pictures == []
+    found.hold.clear()
+    client = KatalogClient(BASE, f"{BASE}/token", "worker", "not-a-secret")
+    client._http = httpx.Client(transport=httpx.MockTransport(catalog))
+    pw = pictures.PictureWorker(client, threading.Event(), "analyzer-0", backfill=False)
+    t = threading.Thread(target=pw.run)
+    t.start()
+    try:
+        broker = run(monkeypatch, catalog, [event(), event(), event()], pictures=pw.submit)
+        assert broker.committed == [0, 1, 2] and found.pictures == []
+    finally:
+        found.hold.set()
+        for _ in range(500):
+            if len(found.pictures) == 3:
+                break
+            time.sleep(0.01)
+        pw.stop.set()
+        t.join(timeout=5)
+    assert found.pictures == [str(media)] * 3 and len(catalog.picture_writes()) == 3
 
 
 # ---------------------------------------------------------------- heartbeat

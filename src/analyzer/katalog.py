@@ -270,8 +270,8 @@ class KatalogClient:
     def put_picture_area(self, kind: str, item_id: str, body: dict[str, Any]) -> bool:
         """Report a measurement of an item's or an extra's picture area (the
         analyzer's picture.Measurement.report(), or {"released": true} for a
-        claim given back unmeasured). Best-effort: False when the catalog
-        did not take it."""
+        claim given back unmeasured; with the claim's token when it is the
+        backfill's). Best-effort: False when the catalog did not take it."""
         try:
             resp = self._request("PUT", f"/api/picture/{kind}/{item_id}", json=body)
         except Exception as e:
@@ -283,15 +283,20 @@ class KatalogClient:
             return False
         return True
 
-    def claim_picture_areas(self, worker: str, limit: int = 1) -> dict[str, Any] | None:
+    def claim_picture_areas(
+        self, worker: str, limit: int = 1, method: str | None = None
+    ) -> dict[str, Any] | None:
         """The backfill's next titles to measure (POST /api/picture/claim):
-        {"items": [{"kind", "id", "itemId", "type", "path", "durationMs"}],
-        "deadline"}, or no items and "idle" with "retryAfterSeconds". None
-        when the catalog has no backfill (404, an older one) or fails."""
+        {"items": [{"kind", "id", "itemId", "type", "path", "durationMs",
+        "token"}], "deadline"}, or no items and "idle" with
+        "retryAfterSeconds". method names the analyzer's measurement: the
+        catalog measures again an area of another. None when the catalog
+        has no backfill (404, an older one) or fails."""
+        body: dict[str, Any] = {"worker": worker, "limit": limit}
+        if method:
+            body["method"] = method
         try:
-            resp = self._request(
-                "POST", "/api/picture/claim", json={"worker": worker, "limit": limit}
-            )
+            resp = self._request("POST", "/api/picture/claim", json=body)
         except Exception as e:
             log.warning("picture.claim_exception", error=str(e)[:200])
             return None

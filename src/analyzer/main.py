@@ -1,7 +1,8 @@
 """Entry point. One process runs:
   - the Kafka event-consumer loop (thread)
-  - the picture-area backfill (thread): the titles the catalog hands out
-    to have their picture area measured, at the catalog's pace
+  - the picture worker (thread): the picture areas of the titles the
+    consumer hands over, and of those the catalog's backfill hands out at
+    its pace
   - a per-item packaging consumer (thread, fed by the FastAPI endpoint)
   - a tiny FastAPI server for /healthz and /readyz, so k8s probes work.
 The event consumer is the actual job; the HTTP server is just kubelet
@@ -21,7 +22,7 @@ import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
-from . import backfill
+from . import pictures
 from .config import Config
 from .katalog import KatalogClient
 from .packager import package_item, package_status
@@ -70,6 +71,31 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
 
+    # The picture worker: the picture areas, each measured in its own
+    # process off the consumer's thread. The consumer hands it the titles
+    # it analyzed (PICTURE_AREA=false: none), and the catalog's backfill
+    # the titles it has no picture area of, at its pace and outside its
+    # quiet hours (its settings picture.backfill*; PICTURE_BACKFILL=false:
+    # none here). Its own client: the threads never share a request.
+    picture_worker: pictures.PictureWorker | None = None
+    picture_thread: threading.Thread | None = None
+    passes = os.environ.get("PICTURE_AREA", "true").lower() != "false"
+    claims = os.environ.get("PICTURE_BACKFILL", "true").lower() != "false"
+    if passes or claims:
+        picture_client = KatalogClient(
+            base_url=cfg.katalog_api_url,
+            token_url=cfg.oidc_token_url,
+            client_id=cfg.oidc_client_id,
+            client_secret=cfg.oidc_client_secret,
+        )
+        picture_worker = pictures.PictureWorker(
+            picture_client, stop, socket.gethostname(), passes=passes, backfill=claims
+        )
+        picture_thread = threading.Thread(
+            target=picture_worker.run, daemon=True, name="analyzer-pictures"
+        )
+        picture_thread.start()
+
     # Single event-consumer thread. It CONSUMEs the enriched-item topic,
     # runs the per-file pipeline, and PRODUCEs the analyzed-item topic.
     # Replaces the old per_file + tidb_first claim-poll threads — tidb
@@ -86,31 +112,12 @@ def main() -> int:
             "produce_step": cfg.produce_step,
             "error_sleep": cfg.error_sleep_seconds,
             "stop": stop,
+            "pictures": picture_worker.submit if picture_worker is not None else None,
         },
         daemon=True,
         name="analyzer-consumer",
     )
     worker_thread.start()
-
-    # The picture-area backfill: the catalog hands out the titles it has no
-    # picture area of, at its pace and outside its quiet hours (its settings
-    # picture.backfill*); off here with PICTURE_BACKFILL=false. Its own
-    # client: the two threads never share a request.
-    backfill_thread: threading.Thread | None = None
-    if os.environ.get("PICTURE_BACKFILL", "true").lower() != "false":
-        backfill_client = KatalogClient(
-            base_url=cfg.katalog_api_url,
-            token_url=cfg.oidc_token_url,
-            client_id=cfg.oidc_client_id,
-            client_secret=cfg.oidc_client_secret,
-        )
-        backfill_thread = threading.Thread(
-            target=backfill.run,
-            args=(backfill_client, stop, socket.gethostname()),
-            daemon=True,
-            name="analyzer-picture-backfill",
-        )
-        backfill_thread.start()
 
     # Per-item packaging queue. A single consumer thread runs one
     # shaka-packager invocation at a time — packaging is CPU-bound and
@@ -193,9 +200,9 @@ def main() -> int:
     client.close()
     worker_thread.join(timeout=15)
     pkg_thread.join(timeout=10)
-    if backfill_thread is not None:
-        # A measurement stops at its next sample and gives its title back.
-        backfill_thread.join(timeout=15)
+    if picture_thread is not None:
+        # A measurement's process is stopped, and a claim's title given back.
+        picture_thread.join(timeout=15)
     return 0
 
 
