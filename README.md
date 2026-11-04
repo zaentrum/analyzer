@@ -7,8 +7,9 @@ subtitles, and cross-episode audio-fingerprint (chromaprint)
 intro/credits detection — writes their segments, chapters and step
 statuses to the catalog API, and emits `stube.catalog.item.analyzed`
 for the transcoder. It measures each title's picture area, and the
-catalog's backfill of the titles that have none. It also carries a
-per-item CMAF packager.
+catalog's backfill of the titles that have none; it reads the chapters
+of the titles that miss theirs, as the catalog's chapter backfill hands
+them out. It also carries a per-item CMAF packager.
 
 ## Picture area
 
@@ -227,6 +228,57 @@ a file cut short (every stream stopping more than 3 s before the end it
 says), or one whose samples leave more than four gaps, or one longer than
 30 s from its keyframe: the players fit their whole frame.
 
+## Chapters
+
+A title's chapters live in the catalog, not in its package, which carries
+none: the original is the only place they are read from. The analyzer
+reads them from the original's header (`pipelines/chapters.py`): ffprobe
+with `-nofind_stream_info`, the container's chapter marks, its format's
+duration and its streams' durations, and nothing probed or decoded — a
+header takes seconds even of a remux, most of it an MKV's attachments.
+
+A mark the header gives no end (Matroska written without
+`ChapterTimeEnd`, as mkvmerge writes a simple chapter file; an MP4's Nero
+chapters) ends where the next later mark starts, the last where the file
+does (the format's duration, else its longest stream's, else the
+catalog's length of the title): what ffprobe works out itself once it
+decodes. A start before 0 is 0. A mark that still has no length is left
+out, and counted: a read says how many marks the header held (`found`)
+and which it left out (`note`). A title keeps no control character and
+at most 120 characters.
+
+A read that fails is no file without chapters. ffprobe that exits with an
+error, prints no JSON or does not answer within 2 minutes
+(`CHAPTERS_READ_TIMEOUT_S`, `120`), or a file that is not there, fails the
+read: the `chapter` step fails (the catalog retries it), the catalog counts
+the failed read (`PUT /api/chapters/items/{id}` with `"read": {"error"}`)
+and the title's chapters stay as they are. A read that ran writes the
+chapters, the whole set in place of the title's, with what the read was
+(`"read": {"path", "fileSize", "found", "note", "probe", "seconds"}`),
+before the step says it is done — `skipped` for a header that holds no
+chapter with a length — so a step that says so means the catalog holds
+what the header holds. The catalog keeps each read (its migration 055): a
+read that found none settles a title as one that wrote chapters does, and
+so does one whose reads failed five times in a row (`unreadable`).
+
+The pass of a new title reads the chapters first among its detectors; a
+pass that finds the `chapter` step finished leaves the chapters alone.
+The catalog's chapter backfill hands out the titles that miss theirs (an
+original whose record says it has chapters, none in the catalog, no read
+of that original that settled it): a title never analyzed, one whose
+read failed, one an older analyzer read. A thread of its own
+(`chapter_backfill.py`, its own client) asks for them (`POST
+/api/chapters/claim`, a title at a time), reads each original's header and
+reports the read with the claim's token. Which titles, how many an hour
+and when are the catalog's to say (`chapters.backfill*`, off by default,
+never from 17:00 to 22:00 UTC by default): while it hands out nothing the
+thread waits as long as the catalog says (30 s to an hour; 10 minutes for
+a catalog without the backfill). It starts a read only up to 10 s before
+its claim's deadline, reads no longer than the deadline, and gives the
+title back unread when the deadline cuts a read short or the analyzer
+stops (`{"released": true}`), which is no failure of the title.
+`CHAPTER_BACKFILL=false` asks for none.
+
 ## Intro and recap bounds
 
 An intro is 10 s to 3 min long and a recap 10 s to 5 min, neither more
@@ -264,6 +316,13 @@ busy replica has finished its item.
   untouched, so that it writes the whole set. If one of them can't find
   its segments again (an error, or tidb answering an outage with
   nothing), the set is left as it is.
+- The `chapter` step writes the chapters before it says it is done or
+  skipped, and fails when the header can't be read (see
+  [Chapters](#chapters)). A pass that skips a finished `chapter` step
+  writes no chapters, so a header it could not read now never empties
+  the catalog's; and a `done` one whose header can't be read again leaves
+  the segments alone, as any `done` step that can't find its segments
+  again does.
 - A `chromaprint` step waiting for a run that the pass can't make (no
   sibling episodes now, or the catalog can't list them) is answered
   `skipped` or `failed` rather than left waiting.
@@ -279,8 +338,9 @@ busy replica has finished its item.
 src/analyzer/main.py              # entry point (uvicorn /healthz + /readyz side-car to worker loop)
 src/analyzer/worker.py            # claim/process loop
 src/analyzer/pictures.py          # the picture worker: the analyze pass's titles, then the backfill's
+src/analyzer/chapter_backfill.py  # the chapter backfill: the chapters of the titles that miss theirs
 src/analyzer/config.py            # env-driven config
-src/analyzer/katalog.py           # catalog API client (claim, upsert step, fail, picture areas)
+src/analyzer/katalog.py           # catalog API client (claim, upsert step, fail, picture areas, chapters)
 src/analyzer/packager.py          # per-item CMAF packager (shaka-packager, HEVC passthrough)
 src/analyzer/pipelines/           # chapters, silence, blackframe, subtitles, chromaprint, tidb, fuser
 src/analyzer/pipelines/picture/   # the picture area: sources, planes, rules, its own process
@@ -303,6 +363,13 @@ subtitles in a bar between keyframes, credits, fades, a windowbox, a
 trailer, a still, a length past the catalog's, an anamorphic DVD,
 interlaced MPEG-TS, a rotated video, fonts in Matroska, packages); those
 are skipped without an ffmpeg that encodes H.264, and take about a minute.
+
+The chapter tests read small files ffmpeg makes with chapter marks
+(Matroska and MP4, and one mkvmerge writes where it is installed) with the
+ffprobe on the PATH, and hold the rules of the marks, a header that can't
+be read and a read that answers too late (`tests/test_chapters.py`); the
+pass's chapter step and the backfill run against a fake catalog
+(`tests/test_redelivery.py`, `tests/test_chapter_backfill.py`).
 
 ## Build the container
 
