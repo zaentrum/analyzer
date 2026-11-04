@@ -286,8 +286,12 @@ original it names (`sourceId`). Which titles, how many an hour and when are
 the catalog's to say (`chapters.backfill*`, off by default, never from 17:00
 to 22:00 UTC by default): while it hands out nothing the thread waits as
 long as the catalog says (30 s to an hour; 10 minutes for a catalog without
-the backfill), a second after a claim whose titles the catalog settled from
-their records, and a second at least between two claims. It starts a read
+the backfill, or one that fails the claim), a second after a claim whose
+titles the catalog settled from their records, and a second at least
+between two claims. A claim's answer is waited for 60 s, well past the
+catalog's own bound of a claim (20 s, whatever its storage does); a claim
+not answered by then is no sign that the catalog can't be asked, only that
+it is slow, and is asked again after 30 s. It starts a read
 only up to 10 s before its claim's deadline, reads no longer than the
 deadline, and gives the title back unread when the deadline cuts a read
 short or the analyzer stops (`{"released": true}`), which is no failure of
