@@ -36,9 +36,12 @@ log = structlog.get_logger(__name__)
 
 # How long to wait when the catalog has no chapter backfill (an older one),
 # or can't be asked; the bounds of a wait the catalog asks for when it hands
-# out nothing.
+# out nothing; the wait after a claim whose titles the catalog settled from
+# their source records alone, and the least wait between two claims.
 NO_BACKFILL_WAIT_S = 600.0
 WAIT_MIN_S, WAIT_MAX_S = 30.0, 3600.0
+SETTLED_WAIT_S = 1.0
+CLAIM_GAP_S = 1.0
 # A read is started only this long before its claim's deadline at the
 # latest: a header takes seconds.
 MIN_READ_S = 10.0
@@ -70,6 +73,10 @@ class ChapterBackfill:
             return NO_BACKFILL_WAIT_S
         jobs: list[dict[str, Any]] = claim.get("items") or []
         if not jobs:
+            if _int(claim.get("settled")) > 0:
+                # the catalog settled titles from their records: more may wait
+                log.info("chapters.backfill_settled", settled=claim.get("settled"))
+                return SETTLED_WAIT_S
             try:
                 wait = float(claim.get("retryAfterSeconds") or WAIT_MAX_S)
             except (TypeError, ValueError):
@@ -79,7 +86,9 @@ class ChapterBackfill:
         deadline = _time(claim.get("deadline"))
         for job in jobs:
             self.read_job(job, deadline)
-        return 0.0
+        # never a claim straight after a claim: a title the catalog hands out
+        # again at once costs a second at least
+        return CLAIM_GAP_S
 
     def read_job(self, job: dict[str, Any], deadline: float | None) -> None:
         """Read one title the catalog handed out and report it with its
@@ -112,12 +121,13 @@ class ChapterBackfill:
         if r.interrupted or (r.timed_out and cut):
             self._release(item_id, token, r.error or "")
             return
+        source = str(job.get("sourceId") or "") or None
         try:
             if r.ok:
-                self.client.put_chapters(item_id, r.chapters, read=r.report(), token=token)
+                self.client.put_chapters(item_id, r.chapters, read=r.report(source), token=token)
             else:
-                self.client.report_chapters_failed(item_id, r.report(), token=token)
-        except Exception as e:  # its lease ends, and the catalog counts it
+                self.client.report_chapters_failed(item_id, r.report(source), token=token)
+        except Exception as e:  # its lease ends, and the catalog hands it out again
             log.warning("chapters.backfill_report_failed", item_id=item_id, error=str(e)[:300])
             return
         log.info(
@@ -139,6 +149,13 @@ def enabled() -> bool:
     (CHAPTER_BACKFILL, true unless false): the catalog decides whether it
     hands any out."""
     return os.environ.get("CHAPTER_BACKFILL", "true").lower() != "false"
+
+
+def _int(v: Any) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _time(v: Any) -> float | None:

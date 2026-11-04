@@ -98,13 +98,16 @@ def test_a_title_handed_out_is_read_and_reported_with_its_token(
     )
     asked = a_read(monkeypatch, found)
     catalog = Catalog({"items": [job("/m.mkv")], "deadline": at(1800)})
-    assert backfill(catalog).claim_once() == 0.0
+    # a second at least before the next claim
+    assert backfill(catalog).claim_once() == chapter_backfill.CLAIM_GAP_S
     assert catalog.asked == [("analyzer-0", 1)]
     [(item, chs, read, token)] = catalog.put
     assert item == "m1" and token == "tok-1" and chs == found.chapters
     assert (
         read["found"] == 3 and read["probe"] == "ffprobe version 4.4.2" and read["path"] == "/m.mkv"
     )
+    # the read is of the original the claim named
+    assert read["sourceId"] == "s1"
     # read with the title's length, and no longer than the read's own timeout
     assert asked[0]["duration_ms"] == 60_000 and asked[0]["timeout"] == chapters.read_timeout()
 
@@ -123,6 +126,14 @@ def test_a_read_that_failed_is_reported_with_its_token(monkeypatch) -> None:
     assert (item, token) == ("m1", "tok-1") and read[
         "error"
     ] == "ffprobe exited 1: moov atom not found"
+    assert read["transient"] is False and read["sourceId"] == "s1"
+
+
+def test_a_claim_that_settled_titles_from_their_records_is_followed_at_once() -> None:
+    catalog = Catalog(
+        {"items": [], "settled": 50, "idle": "50 titles were settled", "retryAfterSeconds": 1}
+    )
+    assert backfill(catalog).claim_once() == chapter_backfill.SETTLED_WAIT_S
 
 
 def test_a_read_of_a_real_file(tmp_path: Path) -> None:
