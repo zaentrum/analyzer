@@ -145,6 +145,20 @@ def analyze_one(
             raise ChapterReadFailed(chapter_result.error or "the header could not be read")
         return chapter_segments
 
+    def kept_chapter_signal() -> list[dict]:
+        # A done chapter step's share of the segments, as the fuser takes
+        # it from a pass that writes the whole set: of the header, read now;
+        # else of the chapters the catalog keeps (the step wrote them); else
+        # nothing, and the other steps' segments are written all the same.
+        if chapter_result.ok:
+            return chapter_segments
+        stored = client.get_chapters(item.id) if client is not None else None
+        if stored is None:
+            log.warning("segments.chapter_share_unknown", item_id=item.id,
+                        error=(chapter_result.error or "")[:200])
+            return []
+        return chapters.segments_of(stored)
+
     # TIDB runs FIRST among the network/per-file detectors. It's a cheap
     # (~0.5 s) call that, on a hit, gives us segments at confidence 0.98
     # — strictly better than anything the local detectors can produce.
@@ -216,7 +230,7 @@ def analyze_one(
                                details="no sibling episodes to fingerprint against")
 
     beat_every = _heartbeat_seconds()
-    signals: list[list[dict]] = []
+    signals: list[tuple[str, list[dict]]] = []
     # Pipelines short-circuited as `done`: they found segments in an earlier
     # pass, which the catalog holds and this pass doesn't (see _fuse).
     kept: list[tuple[str, Callable[[], list[dict]]]] = []
@@ -233,7 +247,7 @@ def analyze_one(
                 prior_status=prior,
             )
             if prior == "done":
-                kept.append((name, run))
+                kept.append((name, kept_chapter_signal if name == "chapter" else run))
             continue
         # Step bookkeeping: flip to in_progress before, then done/failed/
         # skipped after, and in_progress again every beat_every while the
@@ -253,7 +267,7 @@ def analyze_one(
                         client.put_chapters(item.id, chapter_atoms,
                                             read=chapter_result.report(item.path))
                     chapters_read = chapter_atoms
-            signals.append(sig)
+            signals.append((name, sig))
             log.info(
                 "pipeline.done",
                 pipeline=name,
@@ -280,7 +294,7 @@ def analyze_one(
                 client.upsert_step(item.id, name, step_status, details=details)
         except Exception as e:
             log.exception("pipeline.failed", pipeline=name, item_id=item.id, error=str(e)[:300])
-            signals.append([])
+            signals.append((name, []))
             if client is not None:
                 if name == "chapter" and not chapter_result.ok:
                     # the catalog counts the failed read (055): a title
@@ -312,7 +326,7 @@ def _chapter_details(result: chapters.ChapterResult) -> str:
 
 def _fuse(
     item: ClaimedItem,
-    signals: list[list[dict]],
+    signals: list[tuple[str, list[dict]]],
     kept: list[tuple[str, Callable[[], list[dict]]]],
 ) -> list[dict] | None:
     """The item's segments from what this pass's pipelines found, or None to
@@ -329,11 +343,15 @@ def _fuse(
     that can't find again what it found (it fails, or finds nothing — tidb
     answers an outage with nothing) leaves the segments alone rather than
     have them written without its share. (`chapter` is done for a file with
-    chapters, segments or not, and its detector already ran above; one whose
-    header could not be read this time fails, and leaves them alone.)"""
+    chapters, segments or not, and its detector already ran above; a done
+    one whose header can't be read now gives the segments of the chapters
+    the catalog keeps, or none, and never keeps the others' from being
+    written.) Where only the chapter step found something (a retry of it)
+    the segments stay as they are: that is no reason to run the done
+    detectors again, each a decode of the whole file."""
     if kept:
-        if not any(signals):
-            log.info("segments.kept", item_id=item.id, reason="nothing new",
+        if not any(sig for name, sig in signals if name != "chapter"):
+            log.info("segments.kept", item_id=item.id, reason="nothing new but the chapters'",
                      pipelines=[name for name, _ in kept])
             return None
         for name, run in kept:
@@ -346,9 +364,9 @@ def _fuse(
             if not found and name != "chapter":
                 log.warning("segments.kept", item_id=item.id, reason=f"{name} found nothing")
                 return None
-            signals = [*signals, found]
+            signals = [*signals, (name, found)]
     # The runtime bounds an intro and a recap too (a quarter of it at most).
-    fused = fuser.merge(signals, duration_ms=item.duration_ms)
+    fused = fuser.merge([sig for _, sig in signals], duration_ms=item.duration_ms)
     # Drop segments that don't apply to this media type (e.g. intro on a
     # movie is always noise — movies aren't a recurring series).
     drop_kinds = SUPPRESSED_KINDS.get(item.type, set())

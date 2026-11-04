@@ -192,4 +192,4 @@ def test_the_worker_bounds_the_segments_by_the_items_runtime() -> None:
     item = ClaimedItem(id="i", type="episode", title="Clip", year=None,
                        duration_ms=360_000, path="clip.mkv")
     theme = _seg("intro", 0, 100_000, "chromaprint", 0.80, "chromaprint x2")
-    assert worker._fuse(item, [[theme]], []) == []
+    assert worker._fuse(item, [("chromaprint", [theme])], []) == []

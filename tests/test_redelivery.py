@@ -91,11 +91,12 @@ class Catalog:
     next read returns, as the real one does."""
 
     def __init__(self, path: Path, steps: dict[str, str], *, siblings: bool | str = False,
-                 chapters_status: int = 200) -> None:
+                 chapters_status: int = 200, stored: list[dict] | None = None) -> None:
         self.path = path
         self.steps = dict(steps)
         self.siblings = siblings
         self.chapters_status = chapters_status  # what a chapters PUT is answered
+        self.stored = stored  # the chapters a GET of them answers (None: 404)
         self.writes: list[tuple[str, str, object]] = []
 
     def detail(self, item_id: str) -> dict:
@@ -130,6 +131,10 @@ class Catalog:
             return httpx.Response(200, json={"itemId": ITEM, "steps": self.steps})
         if request.method == "GET" and path == f"/api/picture/items/{ITEM}":
             return httpx.Response(404, text="no picture area")
+        if request.method == "GET" and path == f"/api/chapters/items/{ITEM}":
+            if self.stored is None:
+                return httpx.Response(404, text="no such title")
+            return httpx.Response(200, json={"itemId": ITEM, "chapters": self.stored})
         if request.method == "GET" and path == f"/api/analyze/items/{ITEM}/siblings":
             if self.siblings == "error":
                 return httpx.Response(503, text="catalog busy")
@@ -522,8 +527,44 @@ def test_a_pass_that_skips_a_done_chapter_step_writes_no_chapters(monkeypatch, m
     run(monkeypatch, catalog, [event()])
     assert catalog.chapter_writes() == []
     assert catalog.step_writes("chapter") == []
-    # nor the segments: the done chapter step can't find its share again
+    # the segments blackframe found are written all the same, with the done
+    # steps' (the catalog keeps no chapters: the chapter step's share is none)
+    [segments] = catalog.segment_writes()
+    assert sorted(seg["source"] for seg in segments) == ["blackframe", "subtitle", "tidb"]
+
+
+def test_a_done_chapter_steps_share_comes_from_the_chapters_the_catalog_keeps(
+    monkeypatch, media,
+) -> None:
+    # A retry of blackframe whose header can't be read now: the done chapter
+    # step's share of the segments is of the chapters the catalog keeps.
+    credits = {"title": "End Credits", "startMs": 2_550_000, "endMs": 2_600_000, "ordinal": 2}
+    catalog = Catalog(media, {**DONE, "blackframe": "failed"}, stored=[
+        {"title": "Act 1", "startMs": 0, "endMs": 2_550_000, "ordinal": 1}, credits])
+    Detectors(monkeypatch)
+    unreadable(monkeypatch)
+    run(monkeypatch, catalog, [retry()])
+    [segments] = catalog.segment_writes()
+    # the end credits the chapter marks (merged with blackframe's), the
+    # intro and the recap the done steps found again
+    assert [(seg["kind"], seg["source"]) for seg in segments] == [
+        ("intro", "tidb"), ("recap", "subtitle"), ("credits", "chapter")]
+    assert catalog.step_writes("blackframe")[-1] == ("blackframe", "done")
+
+
+def test_a_retry_of_the_chapter_step_runs_no_done_detector(monkeypatch, media) -> None:
+    # The header has an end-credits chapter now: that alone is no reason to
+    # decode the whole file again for the done detectors' share of the set.
+    catalog = Catalog(media, {**DONE, "chapter": "failed"})
+    found = Detectors(monkeypatch)
+    credits = {"title": "End Credits", "startMs": 2_550_000, "endMs": 2_600_000, "ordinal": 2}
+    monkeypatch.setattr(chapters, "detect", lambda *_a, **_k: chapters.ChapterResult(
+        segments=chapters.segments_of([credits]), chapters=[credits]))
+    run(monkeypatch, catalog, [retry()])
+    assert found.calls == []
     assert catalog.segment_writes() == []
+    assert [w["chapters"] for w in catalog.chapter_writes()] == [[credits]]
+    assert catalog.step_writes("chapter")[-1] == ("chapter", "done")
 
 
 def test_a_retry_reads_a_failed_chapter_step_again(monkeypatch, media) -> None:

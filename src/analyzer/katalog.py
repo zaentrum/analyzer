@@ -267,6 +267,23 @@ class KatalogClient:
         except (ValueError, AttributeError):
             return None
 
+    def get_chapters(self, item_id: str) -> list[dict[str, Any]] | None:
+        """The chapters the catalog keeps of an item (GET
+        /api/chapters/items/{id}): [{"startMs", "endMs", "title", "ordinal"}].
+        None when it can't say (an older catalog, or a failure)."""
+        try:
+            resp = self._request("GET", f"/api/chapters/items/{item_id}")
+        except Exception as e:
+            log.warning("chapters.get_exception", item_id=item_id, error=str(e)[:200])
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            chs = resp.json().get("chapters")
+        except (ValueError, AttributeError):
+            return None
+        return chs if isinstance(chs, list) else None
+
     def report_chapters_failed(
         self, item_id: str, read: dict[str, Any], *, token: str | None = None
     ) -> bool:
