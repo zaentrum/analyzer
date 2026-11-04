@@ -70,6 +70,27 @@ once (PyAV), each sample labelled with its frame's own time:
 - a title of five minutes or less (512 MiB at most) is decoded through, a
   sample a second.
 
+What the samples leave more than 3 s apart is then decoded again, frame by
+frame: the title's tail, from its last sample to the end of the file; its
+head, before its first sample; and up to four gaps between, each at most
+30 s of the title from the keyframe its run starts at, as one long group of
+pictures leaves (`sampling.closed`: the runs, their frames, bytes and CPU).
+A run decodes the reference frames only until it nears the gap (none of the
+gap's frames refers to those it skips), then every frame. A title with more
+such gaps, or a longer one, is sampled far apart all through (a package's
+encoded rung): it is not decoded again, and stays in doubt.
+
+The title's picture starts at its first keyframe (`sampling.videoStartS`,
+when that is not its first frame): a file copied from inside a group of
+pictures has frames before it that lack their reference frames, which no
+decoder makes exactly and no player shows; a frame before it that the
+decoder makes all the same (from a keyframe its container does not mark) is
+a sample. The picture ends at the end the file says, or at its video's last
+frame (`videoEndS`) when the file runs on past that to its end, its sound
+longer than its picture: its tail, read to the end of the file, says where
+every stream's data ends (`dataEndS`). A file whose every stream stops more
+than 3 s short of the end it says is cut short, and keeps that end.
+
 An original's reads have no budget but twice its size; one can be set
 (`PICTURE_ORIGINAL_READ_MB_PER_HOUR`).
 
@@ -100,7 +121,8 @@ frames: the same memory for ten samples or six thousand.
 The edges are rounded outwards to even pixels. A measurement that did not
 stop early with the whole frame says it can't tell (`reason`, and
 `sampling.doubt`) when its samples are more than 3 s apart anywhere in the
-title, from its start to its end (`gap`), when
+title, from where its picture starts to where it ends, once its gaps were
+decoded frame by frame (`gap`), when
 the read budget stopped it (`budget`), when a seek decoded another frame
 than the keyframe it sought (`missed`), or when one landed on a frame
 another sample took (`duplicates`); also with too few samples that show a
@@ -180,12 +202,30 @@ claim's (the catalog's lease), both six hours: the whole measurement of a
 which leaves room for the analysis the worker shares its pod with at a
 higher priority. A report says what it took (`seconds`, `cpuSeconds`).
 
+Decoding the head or the tail again costs a title one group of pictures
+(its reference frames up to the gap, every frame from a second before it)
+and the sound's packets to the end of the file, whatever the title's
+length; measured at background priority as above (the CPU an upper bound),
+with the decoder's two threads, on letterboxed titles whose sound runs 7 s
+past their picture:
+
+| the title | decoded again | frames | read | CPU | of the measurement's CPU |
+|---|---|---|---|---|---|
+| 6 min of 1080p HEVC at 3.5 Mbit/s, x265's own keyframes, a last group of 7 s | the tail | 114 | 9.8 MiB | 2.4 s | 2.4 % |
+| the same in H.264 at 8 Mbit/s, a keyframe at each cut and every 10 s | the tail | 45 | 5.4 MiB | 0.9 s | 0.7 % |
+| 3 min of 4K HEVC 10-bit at 46 Mbit/s, a keyframe a second | the tail | 24 | 13 MiB | 4.9 s | 1.9 % |
+| the 1080p HEVC title copied from 1 s into a group of 10 s: 8.75 s before its first keyframe | the head and the tail | 324 | 14 MiB | 2.3 s | 3.5 % |
+
+Of a two-hour film that is a tenth of a per cent or less. Four gaps of 30 s,
+the most decoded again between a title's samples, are 2,880 frames at
+24 fps: some 60 s of CPU at 1080p, some 10 min of a 4K remux's.
+
 What stays unseen: what changes within a shot for less than 3 s, between
 two samples and outside the stretches (a caption shown once in a bar). A
 package's encoded rung can't tell, nor can an original the budget stopped,
-nor a file whose duration runs on more than 3 s past its video's last
-frame (its audio longer, the file cut short): the players fit their whole
-frame.
+a file cut short (every stream stopping more than 3 s before the end it
+says), or one whose samples leave more than four gaps, or one longer than
+30 s from its keyframe: the players fit their whole frame.
 
 ## Intro and recap bounds
 
