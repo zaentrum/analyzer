@@ -249,35 +249,49 @@ at most 120 characters.
 
 A read that fails is no file without chapters. ffprobe that exits with an
 error, prints no JSON or does not answer within 2 minutes
-(`CHAPTERS_READ_TIMEOUT_S`, `120`), or a file that is not there, fails the
-read: the `chapter` step fails (the catalog retries it), the catalog counts
-the failed read (`PUT /api/chapters/items/{id}` with `"read": {"error"}`)
-and the title's chapters stay as they are. A read that ran writes the
-chapters, the whole set in place of the title's, with what the read was
-(`"read": {"path", "fileSize", "found", "note", "probe", "seconds"}`),
-before the step says it is done — `skipped` for a header that holds no
-chapter with a length — so a step that says so means the catalog holds
-what the header holds. The catalog keeps each read (its migration 055): a
-read that found none settles a title as one that wrote chapters does, and
-so does one whose reads failed five times in a row (`unreadable`).
+(`CHAPTERS_READ_TIMEOUT_S`, `120`), a file that is not there, and ffprobe
+that says an error and finds no chapter (ffprobe 4.4 exits 0 with `Read
+error at pos. …` and no chapter when the storage fails it on the chapters'
+element) fail the read: the `chapter` step fails (the catalog retries it),
+the catalog is told (`PUT /api/chapters/items/{id}` with `"read": {"error",
+"transient"}`) and the title's chapters stay as they are. A failure of the
+storage or of the worker (no file, no answer in time, a read stopped, an
+error such as `Input/output error`, `Read error`, `Stale file handle`) is
+`transient`: it says nothing of the file, and the catalog counts it as no
+failure of the title; one of the file itself (`Invalid data found`, `moov
+atom not found`) counts. A read that ran writes the chapters, the whole set
+in place of the title's, with what the read was (`"read": {"path",
+"sourceId", "fileSize", "found", "note", "probe", "seconds"}`), before the
+step says it is done — `skipped` for a header that holds no chapter with a
+length — so a step that says so means the catalog holds what the header
+holds.
+
+A header that holds no chapter is not taken on its word: a file cut short
+before its chapters' element reads as one without chapters, and nothing in
+ffprobe's answer says so. The catalog (its migration 055) never lets a read
+that found none delete chapters, holds it against the original's source
+record (the library's probe of the file, which names its chapters), and
+writes the record's chapters where the record holds some; it settles a
+title as having none only where the record agrees.
 
 The pass of a new title reads the chapters first among its detectors; a
 pass that finds the `chapter` step finished leaves the chapters alone.
-The catalog's chapter backfill hands out the titles that miss theirs (an
-original whose record says it has chapters, none in the catalog, no read
-of that original that settled it): a title never analyzed, one whose
-read failed, one an older analyzer read. A thread of its own
-(`chapter_backfill.py`, its own client) asks for them (`POST
-/api/chapters/claim`, a title at a time), reads each original's header and
-reports the read with the claim's token. Which titles, how many an hour
-and when are the catalog's to say (`chapters.backfill*`, off by default,
-never from 17:00 to 22:00 UTC by default): while it hands out nothing the
-thread waits as long as the catalog says (30 s to an hour; 10 minutes for
-a catalog without the backfill). It starts a read only up to 10 s before
-its claim's deadline, reads no longer than the deadline, and gives the
-title back unread when the deadline cuts a read short or the analyzer
-stops (`{"released": true}`), which is no failure of the title.
-`CHAPTER_BACKFILL=false` asks for none.
+The catalog's chapter backfill reads the titles that miss theirs (an
+original of the title's that no read settled): it settles those it can
+from their source records itself, and hands out the rest, whose records
+can't say. A thread of its own (`chapter_backfill.py`, its own client)
+asks for them (`POST /api/chapters/claim`, a title at a time), reads each
+original's header and reports the read with the claim's token and the
+original it names (`sourceId`). Which titles, how many an hour and when are
+the catalog's to say (`chapters.backfill*`, off by default, never from 17:00
+to 22:00 UTC by default): while it hands out nothing the thread waits as
+long as the catalog says (30 s to an hour; 10 minutes for a catalog without
+the backfill), a second after a claim whose titles the catalog settled from
+their records, and a second at least between two claims. It starts a read
+only up to 10 s before its claim's deadline, reads no longer than the
+deadline, and gives the title back unread when the deadline cuts a read
+short or the analyzer stops (`{"released": true}`), which is no failure of
+the title. `CHAPTER_BACKFILL=false` asks for none.
 
 ## Intro and recap bounds
 
@@ -320,9 +334,13 @@ busy replica has finished its item.
   skipped, and fails when the header can't be read (see
   [Chapters](#chapters)). A pass that skips a finished `chapter` step
   writes no chapters, so a header it could not read now never empties
-  the catalog's; and a `done` one whose header can't be read again leaves
-  the segments alone, as any `done` step that can't find its segments
-  again does.
+  the catalog's. A `done` one gives its share of the segments of the
+  header read now, else of the chapters the catalog keeps (`GET
+  /api/chapters/items/{id}`), else none: the segments the other steps
+  found are written all the same.
+- What the `chapter` step found alone (a retry of it) leaves the segments
+  as they are: it is no reason to run the `done` detectors again, each a
+  decode of the whole file.
 - A `chromaprint` step waiting for a run that the pass can't make (no
   sibling episodes now, or the catalog can't list them) is answered
   `skipped` or `failed` rather than left waiting.
@@ -367,9 +385,11 @@ are skipped without an ffmpeg that encodes H.264, and take about a minute.
 The chapter tests read small files ffmpeg makes with chapter marks
 (Matroska and MP4, and one mkvmerge writes where it is installed) with the
 ffprobe on the PATH, and hold the rules of the marks, a header that can't
-be read and a read that answers too late (`tests/test_chapters.py`); the
-pass's chapter step and the backfill run against a fake catalog
-(`tests/test_redelivery.py`, `tests/test_chapter_backfill.py`).
+be read, what ffprobe's errors say of a read and a read that answers too
+late (`tests/test_chapters.py`); the pass's chapter step and the backfill
+run against a fake catalog (`tests/test_redelivery.py`,
+`tests/test_chapter_backfill.py`). Run them with the ffprobe the image
+carries too (Ubuntu 22.04's 4.4): its header reads differ from newer ones'.
 
 ## Build the container
 
