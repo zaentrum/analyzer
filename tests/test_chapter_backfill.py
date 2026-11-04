@@ -11,9 +11,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from analyzer import chapter_backfill
+from analyzer.katalog import ClaimTimedOut, KatalogClient
 from analyzer.pipelines import chapters
 
 
@@ -24,17 +26,24 @@ class Catalog:
     def __init__(self, *claims: dict[str, Any] | None) -> None:
         self.claims = list(claims)
         self.asked: list[tuple[str, int]] = []
+        self.timeouts: list[float | None] = []
         self.put: list[tuple[str, list[dict], dict, str | None]] = []
         self.failed: list[tuple[str, dict, str | None]] = []
         self.released: list[tuple[str, str]] = []
 
-    def claim_chapters(self, worker: str, limit: int = 1) -> dict[str, Any] | None:
+    def claim_chapters(
+        self, worker: str, limit: int = 1, timeout: float | None = None
+    ) -> dict[str, Any] | None:
         self.asked.append((worker, limit))
-        return (
+        self.timeouts.append(timeout)
+        claim = (
             self.claims.pop(0)
             if self.claims
             else {"items": [], "idle": "done", "retryAfterSeconds": 3600}
         )
+        if isinstance(claim, Exception):
+            raise claim
+        return claim
 
     def put_chapters(
         self, item_id: str, chs: list[dict], *, read: dict | None = None, token: str | None = None
@@ -216,6 +225,52 @@ def test_a_read_stopped_with_its_worker_gives_the_title_back(monkeypatch) -> Non
 def test_a_catalog_that_hands_out_nothing_says_how_long_to_wait(claim, wait: float) -> None:
     catalog = Catalog(claim)
     assert backfill(catalog).claim_once() == wait
+
+
+def test_a_claim_the_catalog_does_not_answer_in_time_is_asked_again_soon() -> None:
+    catalog = Catalog(ClaimTimedOut("timed out"))  # type: ignore[arg-type]
+    # not "can't be asked" (NO_BACKFILL_WAIT_S): the catalog is there, and slow
+    assert backfill(catalog).claim_once() == chapter_backfill.WAIT_MIN_S == 30.0
+    # its answer waited for well past the catalog's own bound of a claim (20 s)
+    assert (
+        catalog.timeouts == [chapter_backfill.CLAIM_TIMEOUT_S]
+        and chapter_backfill.CLAIM_TIMEOUT_S >= 60
+    )
+
+
+def test_the_client_waits_a_claims_timeout_and_says_it_ran_out() -> None:
+    seen: list[dict] = []
+
+    def catalog(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 300})
+        seen.append(request.extensions["timeout"])
+        if request.url.path == "/api/chapters/claim":
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(404)
+
+    client = KatalogClient(
+        "http://catalog.test", "http://catalog.test/token", "worker", "not-a-secret"
+    )
+    client._http = httpx.Client(transport=httpx.MockTransport(catalog))
+    with pytest.raises(ClaimTimedOut):
+        client.claim_chapters("analyzer-0", limit=1, timeout=60.0)
+    assert seen == [{"connect": 60.0, "read": 60.0, "write": 60.0, "pool": 60.0}]
+
+
+def test_a_catalog_that_fails_a_claim_is_asked_again_later() -> None:
+    def catalog(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 300})
+        raise httpx.ConnectError("refused", request=request)
+
+    client = KatalogClient(
+        "http://catalog.test", "http://catalog.test/token", "worker", "not-a-secret"
+    )
+    client._http = httpx.Client(transport=httpx.MockTransport(catalog))
+    assert client.claim_chapters("analyzer-0", limit=1, timeout=60.0) is None
+    worker = chapter_backfill.ChapterBackfill(client, threading.Event(), "analyzer-0")
+    assert worker.claim_once() == chapter_backfill.NO_BACKFILL_WAIT_S
 
 
 def test_a_malformed_title_is_passed_over() -> None:

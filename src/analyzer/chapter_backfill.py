@@ -29,19 +29,24 @@ from typing import Any
 
 import structlog
 
-from .katalog import KatalogClient
+from .katalog import ClaimTimedOut, KatalogClient
 from .pipelines import chapters
 
 log = structlog.get_logger(__name__)
 
 # How long to wait when the catalog has no chapter backfill (an older one),
 # or can't be asked; the bounds of a wait the catalog asks for when it hands
-# out nothing; the wait after a claim whose titles the catalog settled from
-# their source records alone, and the least wait between two claims.
+# out nothing (the least also the wait after a claim it did not answer in
+# time: it is there, and slow); the wait after a claim whose titles the
+# catalog settled from their source records alone, and the least wait between
+# two claims.
 NO_BACKFILL_WAIT_S = 600.0
 WAIT_MIN_S, WAIT_MAX_S = 30.0, 3600.0
 SETTLED_WAIT_S = 1.0
 CLAIM_GAP_S = 1.0
+# How long a claim's answer is waited for: well past the catalog's own bound
+# of a claim (20 s, whatever its storage does).
+CLAIM_TIMEOUT_S = 60.0
 # A read is started only this long before its claim's deadline at the
 # latest: a header takes seconds.
 MIN_READ_S = 10.0
@@ -68,7 +73,12 @@ class ChapterBackfill:
     def claim_once(self) -> float:
         """One claim: its titles read and reported. Returns how long to wait
         before the next one (0: at once)."""
-        claim = self.client.claim_chapters(self.worker, limit=1)
+        try:
+            claim = self.client.claim_chapters(self.worker, limit=1, timeout=CLAIM_TIMEOUT_S)
+        except ClaimTimedOut:
+            # not "can't be asked": the catalog is slow (its storage, most
+            # often), and is asked again soon
+            return WAIT_MIN_S
         if claim is None:
             return NO_BACKFILL_WAIT_S
         jobs: list[dict[str, Any]] = claim.get("items") or []

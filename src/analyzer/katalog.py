@@ -24,6 +24,10 @@ log = structlog.get_logger(__name__)
 TOKEN_REFRESH_LEAD_SECONDS = 30
 
 
+class ClaimTimedOut(Exception):
+    """The catalog did not answer a claim in time: it is there, and slow."""
+
+
 @dataclass
 class ClaimedItem:
     id: str
@@ -316,16 +320,26 @@ class KatalogClient:
             return False
         return resp.status_code < 400
 
-    def claim_chapters(self, worker: str, limit: int = 1) -> dict[str, Any] | None:
+    def claim_chapters(
+        self, worker: str, limit: int = 1, timeout: float | None = None
+    ) -> dict[str, Any] | None:
         """The chapter backfill's next titles to read (POST
         /api/chapters/claim): {"items": [{"id", "type", "path", "sourceId",
         "durationMs", "token"}], "deadline"}, or no items and "idle" with
         "retryAfterSeconds". None when the catalog has no chapter backfill
-        (404, an older one; 503, its migration missing) or fails."""
+        (404, an older one; 503, its migration missing) or fails. timeout is
+        how long its answer is waited for (the client's own when None): a
+        claim not answered by then raises ClaimTimedOut."""
         try:
             resp = self._request(
-                "POST", "/api/chapters/claim", json={"worker": worker, "limit": limit}
+                "POST",
+                "/api/chapters/claim",
+                json={"worker": worker, "limit": limit},
+                **({} if timeout is None else {"timeout": timeout}),
             )
+        except httpx.TimeoutException as e:
+            log.warning("chapters.claim_timeout", error=str(e)[:200], timeout_s=timeout)
+            raise ClaimTimedOut(str(e)) from e
         except Exception as e:
             log.warning("chapters.claim_exception", error=str(e)[:200])
             return None
