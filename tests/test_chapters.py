@@ -182,9 +182,79 @@ def test_a_read_that_answers_too_late_failed(
     t0 = time.monotonic()
     r = chapters.read(str(path), timeout=1)
     assert time.monotonic() - t0 < 10
-    assert not r.ok and r.timed_out and not r.interrupted
+    assert not r.ok and r.timed_out and not r.interrupted and r.transient
     assert r.error == "ffprobe did not answer within 1 s" and r.probe == "ffprobe version fake"
+    report = r.report("s1")
+    assert report["transient"] is True and report["sourceId"] == "s1" and "found" not in report
     chapters.probe_version.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("script", "ok", "transient", "says"),
+    [
+        # a read error of the storage that hits the chapters' element: ffprobe
+        # 4.4 exits 0, prints the error and finds no chapter
+        (
+            'echo "Read error at pos. 2875 (0xb3b)" >&2; echo \'{"chapters": []}\'',
+            False,
+            True,
+            "ffprobe found no chapter and said: Read error at pos. 2875",
+        ),
+        # an error of the file with no chapter found, exit 0
+        (
+            'echo "[matroska,webm] Invalid EBML number" >&2; echo \'{"chapters": []}\'',
+            False,
+            False,
+            "ffprobe found no chapter and said: [matroska,webm] Invalid EBML number",
+        ),
+        # an error elsewhere in a file whose chapters were read
+        (
+            'echo "[matroska,webm] Invalid EBML number" >&2; '
+            'echo \'{"chapters": [{"start_time": "0.0", "end_time": "5.0"}]}\'',
+            True,
+            False,
+            None,
+        ),
+        # the storage failed ffprobe: exit 1
+        (
+            'echo "film.mkv: Input/output error" >&2; exit 1',
+            False,
+            True,
+            "ffprobe exited 1: film.mkv: Input",
+        ),
+        # the file is no media ffprobe can read
+        (
+            'echo "film.mkv: Invalid data found when processing input" >&2; exit 1',
+            False,
+            False,
+            "ffprobe exited 1: film.mkv: Invalid data",
+        ),
+        # no chapter, nothing said: a file without chapters (or one cut short,
+        # which the catalog holds against its record)
+        ("echo '{\"chapters\": []}'", True, False, None),
+    ],
+)
+def test_what_ffprobe_said_decides_the_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    script: str,
+    ok: bool,
+    transient: bool,
+    says: str | None,
+) -> None:
+    fake_ffprobe(tmp_path, monkeypatch, script)
+    path = tmp_path / "film.mkv"
+    path.write_bytes(b"a film")
+    r = chapters.read(str(path))
+    assert r.ok is ok and r.transient is transient
+    if says is not None:
+        assert r.error and r.error.startswith(says)
+    chapters.probe_version.cache_clear()
+
+
+def test_a_file_that_is_not_there_is_the_storages_failure(tmp_path: Path) -> None:
+    r = chapters.read(str(tmp_path / "gone.mkv"))
+    assert not r.ok and r.transient
 
 
 def test_a_read_that_is_stopped_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

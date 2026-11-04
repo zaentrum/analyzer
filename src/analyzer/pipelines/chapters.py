@@ -103,13 +103,20 @@ class ChapterRead:
     seconds: float = 0.0
     probe: str | None = None
     file_size: int | None = None
-    # the read ran out of its time (timed_out), or was stopped (interrupted)
+    # the read ran out of its time (timed_out), or was stopped (interrupted);
+    # transient: it failed for the storage or the worker, which says nothing
+    # of the file (no file to read, no answer in time, an error of the
+    # storage, an ffprobe that could not run)
     timed_out: bool = False
     interrupted: bool = False
+    transient: bool = False
 
-    def report(self) -> dict[str, Any]:
-        """The read as the catalog keeps it (PUT /api/chapters, "read")."""
+    def report(self, source_id: str | None = None) -> dict[str, Any]:
+        """The read as the catalog keeps it (PUT /api/chapters, "read"), of
+        the original source_id (the backfill's claim's) where it is known."""
         out: dict[str, Any] = {"path": self.path, "seconds": round(self.seconds, 3)}
+        if source_id:
+            out["sourceId"] = source_id
         if self.probe:
             out["probe"] = self.probe
         if self.file_size is not None:
@@ -120,6 +127,7 @@ class ChapterRead:
                 out["note"] = self.note
         else:
             out["error"] = self.error or "the header could not be read"
+            out["transient"] = self.transient
         return out
 
 
@@ -149,6 +157,17 @@ class ChapterResult:
         return {"path": path, "found": len(self.chapters)}
 
 
+# What ffprobe says when the storage, not the file, failed it: the read says
+# nothing of the file's chapters then, and counts as no failure of it.
+STORAGE_ERRORS = re.compile(
+    r"input/output error|i/o error|read error|stale (?:nfs )?file handle"
+    r"|resource temporarily unavailable|connection timed out|operation timed out"
+    r"|transport endpoint is not connected|no such device|no such file or directory"
+    r"|permission denied|device or resource busy",
+    re.IGNORECASE,
+)
+
+
 def read(
     path: str,
     *,
@@ -164,15 +183,15 @@ def read(
     t0 = time.monotonic()
     done = ChapterRead(path=path, ok=False, probe=probe_version())
 
-    def failed(error: str) -> ChapterRead:
-        done.error, done.seconds = error[:500], time.monotonic() - t0
-        log.warning("chapters.read_failed", path=path, error=done.error)
+    def failed(error: str, transient: bool) -> ChapterRead:
+        done.error, done.seconds, done.transient = error[:500], time.monotonic() - t0, transient
+        log.warning("chapters.read_failed", path=path, error=done.error, transient=transient)
         return done
 
     try:
         done.file_size = os.stat(path).st_size
     except OSError as e:
-        return failed(f"no file to read: {e.strerror or e}")
+        return failed(f"no file to read: {e.strerror or e}", True)
     limit = read_timeout() if timeout is None else timeout
     try:
         # its own session: a read that is ended takes whatever it started
@@ -185,7 +204,7 @@ def read(
             start_new_session=True,
         )
     except OSError as e:
-        return failed(f"ffprobe could not run: {e}")
+        return failed(f"ffprobe could not run: {e}", True)
     end = t0 + limit
     while True:
         try:
@@ -200,21 +219,29 @@ def read(
                 continue
             _kill(proc)
             if done.interrupted:
-                return failed("the read was stopped")
-            return failed(f"ffprobe did not answer within {limit:g} s")
+                return failed("the read was stopped", True)
+            return failed(f"ffprobe did not answer within {limit:g} s", True)
+    why = " ".join((err or "").split())[-300:]
     if proc.returncode != 0:
-        why = " ".join((err or "").split())[-300:]
-        return failed(f"ffprobe exited {proc.returncode}" + (f": {why}" if why else ""))
+        return failed(
+            f"ffprobe exited {proc.returncode}" + (f": {why}" if why else ""),
+            bool(STORAGE_ERRORS.search(why)),
+        )
     try:
         probed = json.loads(out or "{}")
     except json.JSONDecodeError as e:
-        return failed(f"ffprobe's output is no JSON: {e}")
+        return failed(f"ffprobe's output is no JSON: {e}", False)
     if not isinstance(probed, dict):
-        return failed("ffprobe's output is no JSON object")
+        return failed("ffprobe's output is no JSON object", False)
 
     raw = probed.get("chapters") or []
     if not isinstance(raw, list):
         raw = []
+    if not raw and why:
+        # ffprobe said an error and found no chapter: an error that hit the
+        # chapters' element (a read error of the storage, a file cut short)
+        # leaves none and exits 0 all the same
+        return failed(f"ffprobe found no chapter and said: {why}", bool(STORAGE_ERRORS.search(why)))
     done.ok, done.found = True, len(raw)
     done.chapters = marks(raw, _end_of(probed, duration_ms))
     left = done.found - len(done.chapters)
@@ -243,18 +270,23 @@ def _kill(proc: subprocess.Popen) -> None:
         log.warning("chapters.read_unkilled", pid=proc.pid)
 
 
-def detect(path: str, duration_ms: int | None = None) -> ChapterResult:
-    """Read the chapters of `path`'s header and split them (see the module)."""
-    r = read(path, duration_ms=duration_ms)
+def segments_of(chs: list[dict]) -> list[dict]:
+    """The segments of chapters titled as a TIDB kind (intro, recap,
+    credits): a file's, or those the catalog keeps of it."""
     segments: list[dict] = []
-    for ch in r.chapters:
+    for ch in chs:
         # When the title matches a TIDB kind, also surface it as a
         # high-confidence segment so the fuser can use it (and the
         # player's skip-intro / skip-credits buttons fire on it). The
         # range is the chapter's, as the file has it: the fuser judges
         # whether an intro or a recap can be that long.
-        kind = _classify_chapter(ch["title"] or "")
-        if kind is not None:
+        title = ch.get("title") or ""
+        kind = _classify_chapter(title)
+        if (
+            kind is not None
+            and isinstance(ch.get("startMs"), int)
+            and isinstance(ch.get("endMs"), int)
+        ):
             segments.append(
                 {
                     "kind": kind,
@@ -262,9 +294,16 @@ def detect(path: str, duration_ms: int | None = None) -> ChapterResult:
                     "endMs": ch["endMs"],
                     "source": "chapter",
                     "confidence": 1.00,
-                    "label": ch["title"],
+                    "label": title[:TITLE_MAX] or None,
                 }
             )
+    return segments
+
+
+def detect(path: str, duration_ms: int | None = None) -> ChapterResult:
+    """Read the chapters of `path`'s header and split them (see the module)."""
+    r = read(path, duration_ms=duration_ms)
+    segments = segments_of(r.chapters)
     log.info(
         "chapters.detected",
         path=path,
