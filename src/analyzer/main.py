@@ -3,6 +3,8 @@
   - the picture worker (thread): the picture areas of the titles the
     consumer hands over, and of those the catalog's backfill hands out at
     its pace
+  - the chapter backfill (thread): the chapters of the titles that miss
+    theirs, which the catalog hands out at its pace
   - a per-item packaging consumer (thread, fed by the FastAPI endpoint)
   - a tiny FastAPI server for /healthz and /readyz, so k8s probes work.
 The event consumer is the actual job; the HTTP server is just kubelet
@@ -22,7 +24,7 @@ import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
-from . import pictures
+from . import chapter_backfill, pictures
 from .config import Config
 from .katalog import KatalogClient
 from .packager import package_item, package_status
@@ -95,6 +97,26 @@ def main() -> int:
             target=picture_worker.run, daemon=True, name="analyzer-pictures"
         )
         picture_thread.start()
+
+    # The chapter backfill: the chapters of the titles that miss theirs, read
+    # from each original's header (nothing decoded), which the catalog hands
+    # out at its pace and outside its quiet hours (its settings
+    # chapters.backfill*: off by default; CHAPTER_BACKFILL=false: none
+    # asked here). Its own client, as the picture worker's.
+    chapter_thread: threading.Thread | None = None
+    if chapter_backfill.enabled():
+        chapter_client = KatalogClient(
+            base_url=cfg.katalog_api_url,
+            token_url=cfg.oidc_token_url,
+            client_id=cfg.oidc_client_id,
+            client_secret=cfg.oidc_client_secret,
+        )
+        chapter_thread = threading.Thread(
+            target=chapter_backfill.ChapterBackfill(chapter_client, stop, socket.gethostname()).run,
+            daemon=True,
+            name="analyzer-chapters",
+        )
+        chapter_thread.start()
 
     # Single event-consumer thread. It CONSUMEs the enriched-item topic,
     # runs the per-file pipeline, and PRODUCEs the analyzed-item topic.
@@ -203,6 +225,9 @@ def main() -> int:
     if picture_thread is not None:
         # A measurement's process is stopped, and a claim's title given back.
         picture_thread.join(timeout=15)
+    if chapter_thread is not None:
+        # A read in hand is stopped, and its title given back.
+        chapter_thread.join(timeout=15)
     return 0
 
 
