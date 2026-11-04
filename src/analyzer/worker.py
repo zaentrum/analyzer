@@ -91,11 +91,18 @@ def _heartbeat(
 
 @dataclass
 class AnalyzeResult:
-    """Output of `analyze_one`: segments + chapters posted to two endpoints.
-    `segments` is None when the pass leaves the catalog's segments as they
-    are (see `_fuse`)."""
+    """Output of `analyze_one`: the segments to post, and the chapters the
+    pass's chapter step read. `segments` is None when the pass leaves the
+    catalog's segments as they are (see `_fuse`); `chapters` is None when
+    its chapter step did not run (finished before), or could not read the
+    header: the catalog's chapters stay as they are."""
     segments: list[dict] | None
-    chapters: list[dict]
+    chapters: list[dict] | None
+
+
+class ChapterReadFailed(RuntimeError):
+    """The header of the file could not be read: its chapters are unknown,
+    which is no file without chapters."""
 
 
 def analyze_one(
@@ -120,15 +127,23 @@ def analyze_one(
         log.warning("analyze.missing_file", item_id=item.id, path=item.path)
         raise FileNotFoundError(item.path)
 
-    # Chapters runs in a separate path: ffprobe extracts the file's
-    # structural chapter atoms (Cold Open / Act 1 / Tag) and also lifts
-    # any title-labelled intro / credits / recap chapters into the
-    # fused segments stream. The atoms themselves are written to the
-    # sibling ItemChapters entity via PUT /api/chapters — see
-    # migration 018 for the split rationale.
-    chapter_result = chapters.detect(item.path)
+    # Chapters runs in a separate path: ffprobe reads the file's header
+    # (nothing decoded) for its structural chapter marks (Cold Open / Act 1
+    # / Tag) and also lifts any title-labelled intro / credits / recap
+    # chapters into the fused segments stream. The marks themselves are
+    # written by the chapter step, with what the read was, to the sibling
+    # ItemChapters entity via PUT /api/chapters — see migration 018 for the
+    # split rationale, and the catalog's 055 for the reads. A header that
+    # could not be read fails the step (the catalog retries it) and writes
+    # nothing: it is no file without chapters.
+    chapter_result = chapters.detect(item.path, item.duration_ms)
     chapter_segments = chapter_result.segments
     chapter_atoms    = chapter_result.chapters
+
+    def chapter_signal() -> list[dict]:
+        if not chapter_result.ok:
+            raise ChapterReadFailed(chapter_result.error or "the header could not be read")
+        return chapter_segments
 
     # TIDB runs FIRST among the network/per-file detectors. It's a cheap
     # (~0.5 s) call that, on a hit, gives us segments at confidence 0.98
@@ -153,9 +168,9 @@ def analyze_one(
         # side. The Python modules are still chapters / subtitles
         # (plural) — only the labels change. The `chapter` step is
         # bookkept here even though we already invoked the chapters
-        # detector above, so the Fiori checklist reflects whether the
-        # ffprobe pass ran for this item.
-        ("chapter",    lambda: chapter_segments),
+        # detector above: the step writes the chapters, and says the
+        # catalog holds what the header holds.
+        ("chapter",    chapter_signal),
         ("subtitle",   lambda: subtitles.detect(item.path, item.duration_ms)),
         ("blackframe", lambda: blackframe.detect(item.path, item.duration_ms)),
         ("silence",    lambda: silence.detect(item.path, item.duration_ms)),
@@ -205,6 +220,9 @@ def analyze_one(
     # Pipelines short-circuited as `done`: they found segments in an earlier
     # pass, which the catalog holds and this pass doesn't (see _fuse).
     kept: list[tuple[str, Callable[[], list[dict]]]] = []
+    # The chapters this pass's chapter step read (and wrote, with a client):
+    # None while it has not, or could not read the header.
+    chapters_read: list[dict] | None = None
     for name, run in pipelines:
         prior = pre_existing_status.get(name)
         if prior in short_circuit:
@@ -227,6 +245,14 @@ def analyze_one(
             t0 = time.monotonic()
             with _heartbeat(client, item.id, name, beat_every):
                 sig = run()
+                if name == "chapter":
+                    # The chapters first, then the step: a done or skipped
+                    # chapter step says the catalog holds what the header
+                    # holds. A write that fails fails the step.
+                    if client is not None:
+                        client.put_chapters(item.id, chapter_atoms,
+                                            read=chapter_result.report(item.path))
+                    chapters_read = chapter_atoms
             signals.append(sig)
             log.info(
                 "pipeline.done",
@@ -241,18 +267,25 @@ def analyze_one(
                 # tidb 404 (no tmdb match), chromaprint no siblings, subtitles
                 # no SRT. Distinguishing skipped from done makes the Fiori
                 # checklist read truthfully. The chapter step is marked
-                # "done" when the file had any chapter atoms at all, even
-                # if none of them were title-classified as intro/credits/
-                # recap, since the atoms themselves are useful.
+                # "done" when the file had any chapters at all, even if none
+                # of them were title-classified as intro/credits/recap,
+                # since the chapters themselves are useful, and "skipped"
+                # when its header holds none with a length.
+                details = None
                 if name == "chapter":
                     step_status = "done" if chapter_atoms else "skipped"
+                    details = _chapter_details(chapter_result)
                 else:
                     step_status = "done" if sig else "skipped"
-                client.upsert_step(item.id, name, step_status)
+                client.upsert_step(item.id, name, step_status, details=details)
         except Exception as e:
             log.exception("pipeline.failed", pipeline=name, item_id=item.id, error=str(e)[:300])
             signals.append([])
             if client is not None:
+                if name == "chapter" and not chapter_result.ok:
+                    # the catalog counts the failed read (055): a title
+                    # whose reads fail again and again is settled
+                    client.report_chapters_failed(item.id, chapter_result.report(item.path))
                 client.upsert_step(item.id, name, "failed", error=str(e)[:300])
     fused = _fuse(item, signals, kept)
 
@@ -263,7 +296,18 @@ def analyze_one(
     if client is not None:
         _maybe_extract_keyframe(item, fused or [], client)
 
-    return AnalyzeResult(segments=fused, chapters=chapter_atoms)
+    return AnalyzeResult(segments=fused, chapters=chapters_read)
+
+
+def _chapter_details(result: chapters.ChapterResult) -> str:
+    """What the chapter step read, as its details say it: the chapters
+    written, and the marks the header held."""
+    found = result.read.found if result.read is not None else len(result.chapters)
+    if result.chapters:
+        return f"chapters={len(result.chapters)} found={found}"
+    if found:
+        return f"chapters=0 found={found}: no mark has a length"
+    return "chapters=0: the header holds none"
 
 
 def _fuse(
@@ -285,7 +329,8 @@ def _fuse(
     that can't find again what it found (it fails, or finds nothing — tidb
     answers an outage with nothing) leaves the segments alone rather than
     have them written without its share. (`chapter` is done for a file with
-    chapter atoms, segments or not, and its detector already ran above.)"""
+    chapters, segments or not, and its detector already ran above; one whose
+    header could not be read this time fails, and leaves them alone.)"""
     if kept:
         if not any(signals):
             log.info("segments.kept", item_id=item.id, reason="nothing new",
@@ -393,13 +438,15 @@ def _process_item(item: ClaimedItem, client: KatalogClient, *, retry: bool = Fal
                          short_circuit=FINISHED_STATUSES if retry else SHORT_CIRCUIT)
     if result.segments is not None:
         client.upload_segments(item.id, result.segments)
-    client.upload_chapters(item.id, result.chapters)
+    # (the chapters were written by their step, before it said so; a pass
+    # that did not run the step, or could not read the header, leaves the
+    # catalog's as they are)
     log.info(
         "worker.item_done",
         item_id=item.id,
         title=item.title,
         segments=len(result.segments) if result.segments is not None else "kept",
-        chapters=len(result.chapters),
+        chapters=len(result.chapters) if result.chapters is not None else "kept",
     )
 
 

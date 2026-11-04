@@ -1,5 +1,6 @@
 """HTTP client for the katalog Spring app: fetch item detail, upload
-segments/chapters, bookkeep steps, fail items. JWT token is cached and
+segments/chapters (with what each read of a header was), bookkeep steps,
+fail items, and claim the backfills' titles. JWT token is cached and
 re-fetched on 401.
 
 Work is no longer claimed over HTTP — the analyzer is a pure Kafka
@@ -230,16 +231,29 @@ class KatalogClient:
                 error=str(e)[:200],
             )
 
-    def upload_chapters(self, item_id: str, chapters: list[dict[str, Any]]) -> None:
-        """Replace the chapter set for an item. Chapters are file-internal
-        structural markers (Cold Open / Act 1) extracted by ffprobe and
-        live in com_nalet_katalog_itemchapters — separate from the TIDB-
-        aligned MediaSegments. See migration 018 for the split."""
-        resp = self._request(
-            "PUT",
-            f"/api/chapters/items/{item_id}",
-            json={"chapters": chapters},
-        )
+    def put_chapters(
+        self,
+        item_id: str,
+        chapters: list[dict[str, Any]],
+        *,
+        read: dict[str, Any] | None = None,
+        token: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Replace the chapter set for an item with what a read of its
+        original found, and say what the read was (`read`: chapters.ChapterRead
+        .report()), which the catalog keeps with them (migration 055); token
+        is the backfill's claim the read was for. Chapters are file-internal
+        structural markers (Cold Open / Act 1) read by ffprobe and live in
+        com_nalet_katalog_itemchapters — separate from the TIDB-aligned
+        MediaSegments. See migration 018 for the split. Raises when the
+        catalog did not take them; answers the title's read as it is now
+        (None from a catalog that keeps no reads)."""
+        body: dict[str, Any] = {"chapters": chapters}
+        if read is not None:
+            body["read"] = read
+        if token:
+            body["token"] = token
+        resp = self._request("PUT", f"/api/chapters/items/{item_id}", json=body)
         if resp.status_code >= 400:
             log.error(
                 "chapters.upload_failed",
@@ -248,6 +262,64 @@ class KatalogClient:
                 body=resp.text[:500],
             )
             resp.raise_for_status()
+        try:
+            return resp.json().get("read")
+        except (ValueError, AttributeError):
+            return None
+
+    def report_chapters_failed(
+        self, item_id: str, read: dict[str, Any], *, token: str | None = None
+    ) -> bool:
+        """Say that a read of an item's original failed (`read` with its
+        "error"): the catalog leaves its chapters as they are and counts the
+        failure. Best-effort: False when the catalog did not take it (one
+        older than migration 055 keeps no reads)."""
+        body: dict[str, Any] = {"read": read}
+        if token:
+            body["token"] = token
+        try:
+            resp = self._request("PUT", f"/api/chapters/items/{item_id}", json=body)
+        except Exception as e:
+            log.warning("chapters.report_exception", item_id=item_id, error=str(e)[:200])
+            return False
+        if resp.status_code >= 400:
+            log.warning("chapters.report_failed", item_id=item_id, status=resp.status_code,
+                        body=resp.text[:300])
+            return False
+        return True
+
+    def release_chapters(self, item_id: str, token: str) -> bool:
+        """Give a title the chapter backfill handed out back unread.
+        Best-effort."""
+        try:
+            resp = self._request("PUT", f"/api/chapters/items/{item_id}",
+                                 json={"released": True, "token": token})
+        except Exception as e:
+            log.warning("chapters.release_exception", item_id=item_id, error=str(e)[:200])
+            return False
+        return resp.status_code < 400
+
+    def claim_chapters(self, worker: str, limit: int = 1) -> dict[str, Any] | None:
+        """The chapter backfill's next titles to read (POST
+        /api/chapters/claim): {"items": [{"id", "type", "path", "sourceId",
+        "durationMs", "token"}], "deadline"}, or no items and "idle" with
+        "retryAfterSeconds". None when the catalog has no chapter backfill
+        (404, an older one; 503, its migration missing) or fails."""
+        try:
+            resp = self._request(
+                "POST", "/api/chapters/claim", json={"worker": worker, "limit": limit}
+            )
+        except Exception as e:
+            log.warning("chapters.claim_exception", error=str(e)[:200])
+            return None
+        if resp.status_code != 200:
+            if resp.status_code != 404:
+                log.warning("chapters.claim_failed", status=resp.status_code, body=resp.text[:300])
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
 
     # ------------------------------------------------------ picture areas
     def picture_area(self, kind: str, item_id: str) -> dict[str, Any] | None:

@@ -90,10 +90,12 @@ class Catalog:
     """The catalog's worker protocol. Step writes update the statuses the
     next read returns, as the real one does."""
 
-    def __init__(self, path: Path, steps: dict[str, str], *, siblings: bool | str = False) -> None:
+    def __init__(self, path: Path, steps: dict[str, str], *, siblings: bool | str = False,
+                 chapters_status: int = 200) -> None:
         self.path = path
         self.steps = dict(steps)
         self.siblings = siblings
+        self.chapters_status = chapters_status  # what a chapters PUT is answered
         self.writes: list[tuple[str, str, object]] = []
 
     def detail(self, item_id: str) -> dict:
@@ -109,6 +111,10 @@ class Catalog:
     def segment_writes(self) -> list[list[dict]]:
         return [body["segments"] for _m, path, body in self.writes
                 if path.startswith("/api/segments/")]
+
+    def chapter_writes(self) -> list[dict]:
+        return [body for method, path, body in self.writes
+                if method == "PUT" and path == f"/api/chapters/items/{ITEM}"]
 
     def picture_writes(self) -> list[dict]:
         return [body for method, path, body in self.writes
@@ -133,6 +139,9 @@ class Catalog:
         self.writes.append((request.method, path, body))
         if request.method == "PUT" and "/steps/" in path:
             self.steps[path.rsplit("/", 1)[1]] = body["status"]
+        refused = self.chapters_status != 200
+        if request.method == "PUT" and path.startswith("/api/chapters/") and refused:
+            return httpx.Response(self.chapters_status, text="the catalog is busy")
         return httpx.Response(200, json={})
 
 
@@ -170,7 +179,7 @@ class Detectors:
         monkeypatch.setattr(blackframe, "detect", recorder("blackframe"))
         monkeypatch.setattr(silence, "detect", recorder("silence"))
         monkeypatch.setattr(chromaprint, "detect", recorder("chromaprint"))
-        monkeypatch.setattr(chapters, "detect", lambda _path: chapters.ChapterResult(
+        monkeypatch.setattr(chapters, "detect", lambda *_args, **_kwargs: chapters.ChapterResult(
             segments=[], chapters=[{"title": "Act 1", "startMs": 0, "endMs": 2_600_000}]))
         monkeypatch.setattr(picture, "measure", measure)
 
@@ -458,6 +467,92 @@ def test_a_measurement_never_holds_the_next_title_up(monkeypatch, media) -> None
         pw.stop.set()
         t.join(timeout=5)
     assert found.pictures == [str(media)] * 3 and len(catalog.picture_writes()) == 3
+
+
+# ------------------------------------------------------------ the chapters
+TOO_LATE = "ffprobe did not answer within 120 s"
+
+
+def unreadable(monkeypatch: pytest.MonkeyPatch, why: str = TOO_LATE) -> None:
+    """The file's header can't be read this pass."""
+    monkeypatch.setattr(chapters, "detect", lambda *_a, **_k: chapters.ChapterResult(
+        segments=[], chapters=[], read=chapters.ChapterRead(path="clip.mkv", ok=False, error=why)))
+
+
+def test_a_pass_writes_the_chapters_with_its_read_before_their_step(monkeypatch, media) -> None:
+    catalog = Catalog(media, {})
+    Detectors(monkeypatch)
+    run(monkeypatch, catalog, [event()])
+    [write] = catalog.chapter_writes()
+    assert write["chapters"] == [{"title": "Act 1", "startMs": 0, "endMs": 2_600_000}]
+    assert write["read"] == {"path": str(media), "found": 1}
+    paths = [(m, p) for m, p, _b in catalog.writes]
+    chapter_put = paths.index(("PUT", f"/api/chapters/items/{ITEM}"))
+    [done] = [i for i, (m, p, b) in enumerate(catalog.writes)
+              if p.endswith("/steps/chapter") and b["status"] == "done"]
+    assert chapter_put < done
+    [details] = [b.get("details") for _m, p, b in catalog.writes
+                 if p.endswith("/steps/chapter") and b["status"] == "done"]
+    assert details == "chapters=1 found=1"
+
+
+def test_a_header_that_cant_be_read_fails_the_chapter_step_and_writes_none(
+    monkeypatch, media,
+) -> None:
+    # A failed read is no file without chapters: the step fails (the catalog
+    # retries it), the catalog counts the failed read, and its chapters stay.
+    catalog = Catalog(media, {})
+    found = Detectors(monkeypatch)
+    unreadable(monkeypatch)
+    broker = run(monkeypatch, catalog, [event()])
+    [write] = catalog.chapter_writes()
+    assert "chapters" not in write and write["read"]["error"] == TOO_LATE
+    assert catalog.step_writes("chapter") == [("chapter", "in_progress"), ("chapter", "failed")]
+    # the other passes run, and the title goes on to the transcoder
+    assert found.calls == ["tidb", "subtitle", "blackframe", "silence"]
+    assert [t for t, _e in broker.produced] == ["stube.catalog.item.analyzed"]
+
+
+def test_a_pass_that_skips_a_done_chapter_step_writes_no_chapters(monkeypatch, media) -> None:
+    # A redelivery whose header can't be read now: the old pass wrote the
+    # empty set it read then, which wiped the chapters the done step had.
+    catalog = Catalog(media, {**DONE, "blackframe": "in_progress"})
+    Detectors(monkeypatch)
+    unreadable(monkeypatch)
+    run(monkeypatch, catalog, [event()])
+    assert catalog.chapter_writes() == []
+    assert catalog.step_writes("chapter") == []
+    # nor the segments: the done chapter step can't find its share again
+    assert catalog.segment_writes() == []
+
+
+def test_a_retry_reads_a_failed_chapter_step_again(monkeypatch, media) -> None:
+    catalog = Catalog(media, {**DONE, "chapter": "failed"})
+    found = Detectors(monkeypatch)
+    run(monkeypatch, catalog, [retry()])
+    assert found.calls == []
+    assert [w["read"]["found"] for w in catalog.chapter_writes()] == [1]
+    assert catalog.step_writes("chapter") == [("chapter", "in_progress"), ("chapter", "done")]
+
+
+def test_a_chapter_write_the_catalog_refuses_fails_the_step(monkeypatch, media) -> None:
+    catalog = Catalog(media, {}, chapters_status=503)
+    Detectors(monkeypatch)
+    run(monkeypatch, catalog, [event()])
+    assert catalog.step_writes("chapter")[-1] == ("chapter", "failed")
+
+
+def test_a_header_without_chapters_skips_the_step_saying_so(monkeypatch, media) -> None:
+    catalog = Catalog(media, {})
+    Detectors(monkeypatch)
+    monkeypatch.setattr(chapters, "detect", lambda *_a, **_k: chapters.ChapterResult(
+        segments=[], chapters=[], read=chapters.ChapterRead(path=str(media), ok=True, found=2)))
+    run(monkeypatch, catalog, [event()])
+    [write] = catalog.chapter_writes()
+    assert write["chapters"] == [] and write["read"]["found"] == 2
+    [(status, details)] = [(b["status"], b.get("details")) for _m, p, b in catalog.writes
+                           if p.endswith("/steps/chapter") and b["status"] != "in_progress"]
+    assert (status, details) == ("skipped", "chapters=0 found=2: no mark has a length")
 
 
 # ---------------------------------------------------------------- heartbeat
