@@ -1,8 +1,7 @@
 """Silence detection via ffmpeg's `silencedetect` filter. We scan two
 windows: the first 10% (looking for intro-end / first dialogue) and the
 last 15% (corroborating signal for the blackframe credit boundary).
-Running on the whole file is wasteful and not what intro-skipper does
-either."""
+Running on the whole file is wasteful."""
 
 from __future__ import annotations
 
@@ -24,7 +23,7 @@ SILENCE_END_RE = re.compile(
 # A silence window worth flagging. Shorter than this is usually just a pause
 # between lines of dialogue.
 MIN_SILENCE_SECONDS = 1.5
-# -30 dBFS is intro-skipper's default; -50 misses music tails, -20 is too eager.
+# -30 dBFS: -50 misses music tails, -20 is too eager.
 NOISE_THRESHOLD_DB = -30
 
 

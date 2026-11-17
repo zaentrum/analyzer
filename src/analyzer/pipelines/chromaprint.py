@@ -12,7 +12,7 @@ sliding windows in the target's fingerprint and each sibling's
 fingerprint; runs of low Hamming-distance pairs identify a recurring
 audio sequence (= intro or credits jingle).
 
-This is the same primitive that audio-fingerprint intro-skippers use.
+This is the same primitive that audio-fingerprint intro detectors use.
 We don't ship TransNet / Whisper here yet — pure audio fingerprint
 matching has been sufficient on test material and is dramatically cheaper
 to compute (no GPU, finishes in seconds per episode)."""
@@ -39,7 +39,7 @@ CREDITS_SCAN_SECONDS = 300
 WINDOW_FRAMES = 30
 # Each fingerprint is a 32-bit int, so 32 bits per frame. Up to
 # MAX_BIT_DIFF bits may differ within the window for it to count as a
-# match. Typical audio-fingerprint intro-skippers use ~5/32; we're a
+# match. Audio-fingerprint intro detectors typically use ~5/32; we're a
 # little stricter to favour precision over recall.
 MAX_BIT_DIFF_PER_FRAME = 6
 

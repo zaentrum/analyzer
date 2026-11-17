@@ -1,7 +1,7 @@
 [project]
 name = "analyzer"
 version = "0.1.0"
-description = "intro-skipper-style media segment detector for katalog (chapters, silence, blackframe, whisper, chromaprint)."
+description = "Media segment detector for katalog (chapters, silence, blackframe, whisper, chromaprint)."
 requires-python = ">=3.11"
 dependencies = [
   # HTTP client to katalog API (item detail, upload segments/chapters,

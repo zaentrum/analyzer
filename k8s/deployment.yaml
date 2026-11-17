@@ -2,10 +2,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: analyzer
-  namespace: stube
   labels:
     app: analyzer
-    value-stream: stube
     component: pipeline
     plane: worker
 spec:
@@ -23,7 +21,6 @@ spec:
     metadata:
       labels:
         app: analyzer
-        value-stream: stube
         component: pipeline
         plane: worker
     spec:
@@ -32,11 +29,10 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
-      # Phase 2b runs CPU-only pipelines (chapters, blackframe, silence) so
-      # we don't pin the pod to GPU nodes — the two GPU workers are already
-      # fully allocated by ollama + tdarr. When Phase 2c enables Whisper /
-      # TransNetV2 we add the GPU request and nodeSelector back; until
-      # then any worker can run this.
+      # Phase 2b runs CPU-only pipelines (chapters, blackframe, silence), so
+      # the pod is not pinned to GPU nodes. When Phase 2c enables Whisper /
+      # TransNetV2 the GPU request and nodeSelector come back; until then any
+      # worker can run this.
       tolerations:
         - key: "nvidia.com/gpu"
           operator: "Exists"
@@ -53,7 +49,7 @@ spec:
               # Workers point at the CAP Java manager API for both
               # reads + writes (claim + upsert_step). Service URL with
               # no /api suffix; the client prepends "/api/...".
-              value: "http://katalog-manager-api.stube.svc.cluster.local"
+              value: "http://katalog-manager-api"
             - name: OIDC_TOKEN_URL
               value: "https://sso.example.com/realms/zaentrum/protocol/openid-connect/token"
             - name: OIDC_CLIENT_ID
@@ -72,7 +68,7 @@ spec:
             # broker is PLAINTEXT (no TLS) — override KAFKA_SECURITY_PROTOCOL
             # for a SASL/TLS-fronted broker.
             - name: KAFKA_BROKERS
-              value: "kafka.stube.svc.cluster.local:9092"
+              value: "kafka:9092"
             - name: KAFKA_GROUP_ID
               value: "analyzer-workers"
             - name: CONSUME_TOPIC
