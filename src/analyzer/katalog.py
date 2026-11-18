@@ -11,11 +11,15 @@ which item to process."""
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
+
+if TYPE_CHECKING:
+    from .pipelines.captions import CaptionsRead
 
 log = structlog.get_logger(__name__)
 
@@ -26,6 +30,34 @@ TOKEN_REFRESH_LEAD_SECONDS = 30
 
 class ClaimTimedOut(Exception):
     """The catalog did not answer a claim in time: it is there, and slow."""
+
+
+@dataclass(frozen=True)
+class CaptionsJob:
+    """An original the captions backfill handed out: the original
+    (source_id, what its PUT names) and its title (item_id), where it lies
+    (path), how many video packets to decode in a window (packets) and the
+    claim's token."""
+
+    source_id: str
+    path: str
+    token: str
+    item_id: str | None = None
+    packets: int | None = None
+
+
+@dataclass(frozen=True)
+class CaptionsClaim:
+    """The catalog's answer to a captions claim: the originals to read and
+    the claim's deadline, or none and why (idle), with how long to wait
+    (retry_after_s). malformed counts the originals handed out without a
+    sourceId or a path, passed over."""
+
+    jobs: list[CaptionsJob] = field(default_factory=list)
+    deadline: float | None = None
+    idle: str | None = None
+    retry_after_s: float | None = None
+    malformed: int = 0
 
 
 @dataclass
@@ -352,6 +384,105 @@ class KatalogClient:
         except ValueError:
             return None
 
+    # ---------------------------------------------------- closed captions
+    # The captions backfill's side of the catalog, all of it here: the paths,
+    # the claim's answer and the body of a PUT, as katalog-manager's handler
+    # takes them (its pull request #5: internal/rest/captions.go, its
+    # README's "Closed captions"):
+    #
+    #   POST /api/captions/claim {"worker", "limit"}
+    #     200 {"items": [{"sourceId", "itemId", "path", "packets", "token"}],
+    #          "deadline"}
+    #         or {"items": [], "idle", "retryAfterSeconds"}
+    #     404 no captions backfill (an older catalog), 503 its migration missing
+    #   PUT /api/captions/sources/{sourceId}
+    #     {"token", "original": READ}                    what the read found
+    #     {"token", "released": true}                    given back unread
+    #   READ = {"captionWindows", "duration", "ffprobe"} its windows
+    #       or {"error", "ffprobe"}                      a file it could not read
+    #   captionWindows = [{"at", "start", "end", "frames", "captions"}], every
+    #       window the read placed: "at" its fraction of the video (0 its
+    #       start, 0.1 ... 0.9, at most 30 s or half the video short of its
+    #       end, those that fall on one another one), "start" and "end" the
+    #       presentation seconds of its first and last decoded frame, on the
+    #       file's own timeline, "frames" how many it decoded, "captions"
+    #       whether one showed them; a window that failed decoded 0 frames,
+    #       its times and captions null, and says why ("error"): it is never
+    #       one without captions
+    #   "duration" is the length, in seconds, the windows were placed by: the
+    #       catalog requires every window that length places
+    #
+    # "ffprobe" is the ffprobe that read it, its version line ("ffprobe
+    # version n7.1.5-12-g1fdbca85aa-20260731"): the catalog takes 7.1 alone.
+    # Whether the original has captions, and how many frames were decoded, is
+    # the catalog's to work out of the windows. A read that failed as a whole
+    # (no file, no video, no length, frames without times, a length that
+    # can't be the video's, out of time, stopped) is a file it could not
+    # read. A read whose ffprobe can't be named is no report: put_captions
+    # refuses it, and the backfill gives the original back. The catalog
+    # answers 409 for a token that is neither the claim's nor the one whose
+    # lease ended last, and refuses (400, nothing changed) a read of another
+    # ffprobe than 7.1, one without windows, a window whose "at" is outside 0
+    # to 1, whose end is before its start, whose frames are fewer than 0, or
+    # that shows captions in no frame.
+    def claim_captions(
+        self, worker: str, limit: int = 1, timeout: float | None = None
+    ) -> CaptionsClaim | None:
+        """The captions backfill's next originals to read (POST
+        /api/captions/claim). None when the catalog has no captions backfill
+        (404, an older one; 503, its migration missing) or fails. timeout is
+        how long its answer is waited for (the client's own when None): a
+        claim not answered by then raises ClaimTimedOut."""
+        try:
+            resp = self._request(
+                "POST",
+                "/api/captions/claim",
+                json={"worker": worker, "limit": limit},
+                **({} if timeout is None else {"timeout": timeout}),
+            )
+        except httpx.TimeoutException as e:
+            log.warning("captions.claim_timeout", error=str(e)[:200], timeout_s=timeout)
+            raise ClaimTimedOut(str(e)) from e
+        except Exception as e:
+            log.warning("captions.claim_exception", error=str(e)[:200])
+            return None
+        if resp.status_code != 200:
+            if resp.status_code != 404:
+                log.warning("captions.claim_failed", status=resp.status_code, body=resp.text[:300])
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            return None
+        if not isinstance(body, dict):
+            return None
+        return _captions_claim(body)
+
+    def put_captions(self, job: CaptionsJob, original: CaptionsRead) -> bool:
+        """Report what the read of a handed-out original found, or why it
+        failed, with the claim's token (PUT /api/captions/sources/{sourceId}).
+        Best-effort: False when the catalog did not take it (its lease ends,
+        and the catalog hands the original out again). Raises ValueError,
+        sending nothing, for a read that names no ffprobe."""
+        return self._put_captions(job, {"token": job.token, "original": _captions_read(original)})
+
+    def release_captions(self, job: CaptionsJob) -> bool:
+        """Give an original the captions backfill handed out back unread.
+        Best-effort."""
+        return self._put_captions(job, {"token": job.token, "released": True})
+
+    def _put_captions(self, job: CaptionsJob, body: dict[str, Any]) -> bool:
+        try:
+            resp = self._request("PUT", f"/api/captions/sources/{job.source_id}", json=body)
+        except Exception as e:
+            log.warning("captions.put_exception", source_id=job.source_id, error=str(e)[:200])
+            return False
+        if resp.status_code >= 400:
+            log.warning("captions.put_failed", source_id=job.source_id, status=resp.status_code,
+                        body=resp.text[:300])
+            return False
+        return True
+
     # ------------------------------------------------------ picture areas
     def picture_area(self, kind: str, item_id: str) -> dict[str, Any] | None:
         """The catalog's picture area of an item (kind "items") or an extra
@@ -495,3 +626,83 @@ class KatalogClient:
                 status=resp.status_code,
                 body=resp.text[:300],
             )
+
+
+def _captions_read(r: CaptionsRead) -> dict[str, Any]:
+    """A read as a captions PUT carries it: its windows and the length they
+    were placed by, or why it could not read the file; and the ffprobe that
+    read it (ValueError when it names none)."""
+    if not r.probe:
+        raise ValueError("a read names the ffprobe that read it")
+    # the size of the file read, where it was found (the catalog takes a read
+    # of the file it handed out alone); what the header probe found, where it
+    # ran: streams of captions of their own, and what is off the closed lists
+    head: dict[str, Any] = {}
+    if r.file_size is not None:
+        head["sizeBytes"] = r.file_size
+    if r.caption_streams is not None:
+        head |= {"captionStreams": r.caption_streams, "offList": list(r.off_list)}
+    if r.unreadable or not r.windows or not r.duration or r.timed_out or r.interrupted:
+        return {"error": r.error or "the captions could not be read", "ffprobe": r.probe, **head}
+    return {"captionWindows": [_caption_window(w) for w in r.windows], "duration": r.duration,
+            "ffprobe": r.probe, **head}  # fmt: skip
+
+
+def _caption_window(w: Any) -> dict[str, Any]:
+    """A window of a read as a captions PUT carries it: one that failed
+    decoded no frame, and shows no time and no captions, never "none"."""
+    if w.error or not w.frames or w.start is None or w.end is None:
+        return {"at": w.at, "start": None, "end": None, "frames": 0, "captions": None,
+                "interlacedFrames": None, "repeatFrames": None, "keyframeBefore": None,
+                "error": w.error or "the window decoded no frame"}  # fmt: skip
+    return {"at": w.at, "start": w.start, "end": w.end, "frames": w.frames,
+            "captions": bool(w.captions), "interlacedFrames": w.interlaced,
+            "repeatFrames": w.repeats, "keyframeBefore": bool(w.keyframe_before)}  # fmt: skip
+
+
+def _captions_claim(body: dict[str, Any]) -> CaptionsClaim:
+    """The CaptionsClaim of a captions claim's answer: the originals with a
+    sourceId and a path, the rest counted and logged."""
+    jobs: list[CaptionsJob] = []
+    malformed = 0
+    for it in body.get("items") or []:
+        if not isinstance(it, dict) or not it.get("sourceId") or not it.get("path"):
+            malformed += 1
+            log.warning("captions.claim_malformed", job=str(it)[:300])
+            continue
+        try:
+            packets = int(it["packets"]) if it.get("packets") else None
+        except (TypeError, ValueError):
+            packets = None
+        jobs.append(
+            CaptionsJob(
+                source_id=str(it["sourceId"]),
+                path=str(it["path"]),
+                token=str(it.get("token") or ""),
+                item_id=str(it.get("itemId") or "") or None,
+                packets=packets,
+            )
+        )
+    retry: float | None
+    try:
+        retry = float(body["retryAfterSeconds"]) if body.get("retryAfterSeconds") else None
+    except (TypeError, ValueError):
+        retry = None
+    idle = body.get("idle")
+    return CaptionsClaim(
+        jobs=jobs,
+        deadline=_rfc3339(body.get("deadline")),
+        idle=str(idle) if idle else None,
+        retry_after_s=retry,
+        malformed=malformed,
+    )
+
+
+def _rfc3339(v: Any) -> float | None:
+    """An RFC 3339 time as seconds since the epoch; None when there is none."""
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
