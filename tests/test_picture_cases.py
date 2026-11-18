@@ -569,8 +569,8 @@ def test_an_interlaced_dvd_program_stream_is_decoded_through(media: Path) -> Non
     if not path.exists():
         ff("-f", "lavfi", "-i", "testsrc2=s=360x216:r=50:d=120",
            "-vf", "noise=alls=5:allf=t+u,pad=360:288:0:36:black,tinterlace=mode=interleave_top,"
-           "setsar=64/45,fieldorder=tff", "-c:v", "mpeg2video", "-q:v", "4", "-g", "12",
-           "-flags", "+ilme+ildct", "-top", "1", "-f", "vob", str(path))  # fmt: skip
+           "setsar=64/45,fieldorder=tff,setfield=tff", "-c:v", "mpeg2video", "-q:v", "4", "-g", "12",
+           "-flags", "+ilme+ildct", "-f", "vob", str(path))  # fmt: skip
     m = measure(path, 120_000)
     assert m.sampling["mode"] == "sequential"
     near(m, Box(0, 36, 360, 216), ring=8)
