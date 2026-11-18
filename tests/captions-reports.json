@@ -1,0 +1,427 @@
+{
+ "failed-claim-24-packets": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"error\": \"its claim names 24 video packets a window, where the plan reads 48: a read it can't serve\", \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\"}}",
+  "sizeBytes": 300000000,
+  "verdict": "not known"
+ },
+ "failed-header-said": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"error\": \"its header probe said: [h264 @ 0x1] error while decoding MB 12 7, bytestream -5\", \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000}}",
+  "sizeBytes": 300000000,
+  "verdict": "not known"
+ },
+ "failed-keyframes-listing": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"error\": \"the listing of its keyframes has 0 packets: not the first 1200, nor every packet of its picture\", \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": []}}",
+  "sizeBytes": 300000000,
+  "verdict": "not known"
+ },
+ "failed-off-list": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "vc1",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"error\": \"off the closed lists: codec:vc1\", \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [\"codec:vc1\"]}}",
+  "sizeBytes": 300000000,
+  "verdict": "not known"
+ },
+ "failed-rate-below-one": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "1/2",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"error\": \"its header probe states a frame rate of its picture avg_frame_rate below one frame a second: no plan, its windows can't be placed\", \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": []}}",
+  "sizeBytes": 300000000,
+  "verdict": "not known"
+ },
+ "hevc-captions": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "hevc",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 1.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.1, \"start\": 60.0, \"end\": 61.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.3, \"start\": 180.0, \"end\": 181.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.5, \"start\": 300.0, \"end\": 301.88, \"frames\": 48, \"captions\": true, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.7, \"start\": 420.0, \"end\": 421.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.9, \"start\": 540.0, \"end\": 541.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}], \"duration\": 600.0, \"span\": {\"start\": 0.0, \"end\": 600.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "captions"
+ },
+ "hevc-not-known": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "hevc",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 1.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.1, \"start\": 60.0, \"end\": 61.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.3, \"start\": 180.0, \"end\": 181.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.5, \"start\": 300.0, \"end\": 301.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.7, \"start\": 420.0, \"end\": 421.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.9, \"start\": 540.0, \"end\": 541.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}], \"duration\": 600.0, \"span\": {\"start\": 0.0, \"end\": 600.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0, \"captionsKnown\": false, \"reason\": \"hevc: needs the packets' signature\"}}",
+  "sizeBytes": 300000000,
+  "verdict": "unscanned"
+ },
+ "start-places-no-frame": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": null, \"end\": null, \"frames\": 0, \"captions\": null, \"interlacedFrames\": null, \"repeatFrames\": null, \"keyframeBefore\": null, \"error\": \"no keyframe among the first 1200 video packets\"}, {\"at\": 0.1, \"start\": 60.0, \"end\": 61.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false}, {\"at\": 0.3, \"start\": 180.0, \"end\": 181.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false}, {\"at\": 0.5, \"start\": 300.0, \"end\": 301.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false}, {\"at\": 0.7, \"start\": 420.0, \"end\": 421.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false}, {\"at\": 0.9, \"start\": 540.0, \"end\": 541.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false}], \"duration\": 600.0, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 0.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "not known"
+ },
+ "whole-captions": {
+  "durationMs": 90000,
+  "probe": {
+   "format": {
+    "duration": "90.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "90.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 89.96, \"frames\": 2250, \"captions\": true, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false, \"whole\": true, \"packets\": 2250, \"leading\": 0}], \"duration\": 90.0, \"span\": {\"start\": 0.0, \"end\": 90.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "captions"
+ },
+ "whole-leading-10": {
+  "durationMs": 90000,
+  "probe": {
+   "format": {
+    "duration": "90.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "90.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.4, \"end\": 89.96, \"frames\": 2240, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false, \"whole\": true, \"packets\": 2250, \"leading\": 10}], \"duration\": 90.0, \"span\": {\"start\": 0.4, \"end\": 90.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "none"
+ },
+ "whole-none": {
+  "durationMs": 90000,
+  "probe": {
+   "format": {
+    "duration": "90.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "90.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 89.96, \"frames\": 2250, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false, \"whole\": true, \"packets\": 2250, \"leading\": 0}], \"duration\": 90.0, \"span\": {\"start\": 0.0, \"end\": 90.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "none"
+ },
+ "whole-start-window-said": {
+  "durationMs": 90000,
+  "probe": {
+   "format": {
+    "duration": "90.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "90.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 89.96, \"frames\": 2250, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": false, \"whole\": true, \"packets\": 2250, \"leading\": 0}], \"duration\": 90.0, \"span\": {\"start\": 0.0, \"end\": 90.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "none"
+ },
+ "window-failed": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 1.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.1, \"start\": 60.0, \"end\": 61.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.3, \"start\": 180.0, \"end\": 181.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.5, \"start\": null, \"end\": null, \"frames\": 0, \"captions\": null, \"interlacedFrames\": null, \"repeatFrames\": null, \"keyframeBefore\": null, \"error\": \"47 of its 48 frames have no presentation time: it can't place them\"}, {\"at\": 0.7, \"start\": 420.0, \"end\": 421.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.9, \"start\": 540.0, \"end\": 541.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}], \"duration\": 600.0, \"span\": {\"start\": 0.0, \"end\": 600.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "not known"
+ },
+ "windows-captions": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 1.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.1, \"start\": 60.0, \"end\": 61.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.3, \"start\": 180.0, \"end\": 181.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.5, \"start\": 300.0, \"end\": 301.88, \"frames\": 48, \"captions\": true, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.7, \"start\": 420.0, \"end\": 421.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.9, \"start\": 540.0, \"end\": 541.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}], \"duration\": 600.0, \"span\": {\"start\": 0.0, \"end\": 600.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "captions"
+ },
+ "windows-gop-13s": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 1.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.1, \"start\": 52.0, \"end\": 53.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.3, \"start\": 169.0, \"end\": 170.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.5, \"start\": 299.0, \"end\": 300.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.7, \"start\": 416.0, \"end\": 417.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.9, \"start\": 533.0, \"end\": 534.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}], \"duration\": 600.0, \"span\": {\"start\": 0.0, \"end\": 600.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 13.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "none"
+ },
+ "windows-none": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "600.000000",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "0.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 0.0, \"end\": 1.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.1, \"start\": 60.0, \"end\": 61.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.3, \"start\": 180.0, \"end\": 181.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.5, \"start\": 300.0, \"end\": 301.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.7, \"start\": 420.0, \"end\": 421.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.9, \"start\": 540.0, \"end\": 541.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}], \"duration\": 600.0, \"span\": {\"start\": 0.0, \"end\": 600.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "none"
+ },
+ "windows-start-late": {
+  "durationMs": 600000,
+  "probe": {
+   "format": {
+    "duration": "600.000000",
+    "format_name": "matroska,webm",
+    "start_time": "0.000000"
+   },
+   "streams": [
+    {
+     "avg_frame_rate": "25/1",
+     "codec_name": "h264",
+     "codec_type": "video",
+     "duration": "595.0",
+     "height": 1080,
+     "index": 0,
+     "r_frame_rate": "25/1",
+     "start_time": "5.000000"
+    }
+   ]
+  },
+  "sent": "{\"token\": \"the-claim-s-token\", \"original\": {\"captionWindows\": [{\"at\": 0.0, \"start\": 5.0, \"end\": 6.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.1, \"start\": 63.0, \"end\": 64.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.3, \"start\": 183.0, \"end\": 184.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.5, \"start\": 301.0, \"end\": 302.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.7, \"start\": 421.0, \"end\": 422.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}, {\"at\": 0.9, \"start\": 539.0, \"end\": 540.88, \"frames\": 48, \"captions\": false, \"interlacedFrames\": 0, \"repeatFrames\": 0, \"keyframeBefore\": true}], \"duration\": 600.0, \"span\": {\"start\": 5.0, \"end\": 600.0}, \"ffprobe\": \"ffprobe version n7.1.5-12-g1fdbca85aa-20260731\", \"sizeBytes\": 300000000, \"captionStreams\": 0, \"offList\": [], \"gop\": 2.0}}",
+  "sizeBytes": 300000000,
+  "verdict": "none"
+ }
+}

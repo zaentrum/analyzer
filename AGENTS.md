@@ -5,9 +5,10 @@ consumes `stube.catalog.item.enriched` from Kafka (consumer group `analyzer-work
 its detectors on the title's original (`chapter`, `tidb`, `subtitle`, `blackframe`,
 `silence`, and `chromaprint` across a series' episodes), writes the segments, chapters and
 step statuses to the catalog API (katalog-manager), and sends `stube.catalog.item.analyzed`
-on to the transcoder. Beside that it measures each title's picture area and reads the
-chapters of titles that miss theirs, as the catalog's backfills hand them out. The
-[README](README.md) has the rules of each.
+on to the transcoder. Beside that it measures each title's picture area, reads the
+chapters of titles that miss theirs, and reads whether each original's video carries
+closed captions, as the catalog's backfills hand them out. The [README](README.md) has the
+rules of each.
 
 How a change is proposed and what a pull request has to pass is in the
 [guide to contributing](https://github.com/zaentrum/.github/blob/main/CONTRIBUTING.md);
@@ -23,20 +24,25 @@ python -m compileall src
 
 Python 3.11 or later (`requires-python` in `pyproject.toml`; `build.yml` builds with 3.11).
 At run time the detectors call `ffmpeg` and `ffprobe` from the PATH, `chromaprint` also
-`fpcalc`. The image:
+`fpcalc`; the captions backfill alone runs the pipeline's ffprobe 7.1 (`CAPTIONS_FFPROBE`,
+`/opt/ffmpeg-7.1/bin/ffprobe` in the image), never the PATH's, and refuses any other. The
+image:
 
 ```sh
 docker build -t zaentrum/analyzer .
 ```
 
 It is based on `nvidia/cuda` (12.3 runtime, Ubuntu 22.04) and adds Ubuntu's ffmpeg,
-`libchromaprint-tools` and shaka-packager v3.4.2; `--build-arg BASE=<mirror>/` takes the
+`libchromaprint-tools`, shaka-packager v3.4.2 and the static ffprobe 7.1.5 the captions
+backfill runs (`/opt/ffmpeg-7.1`, its archive's sha256 checked); `--build-arg BASE=<mirror>/` takes the
 base image from a mirror. `image.yml` builds and pushes it on `main`, on a tag `vX.Y.Z` and
 when started by hand.
 
 ## Test
 
-`build.yml` installs `ffmpeg` and `mkvtoolnix` from apt, then runs:
+`build.yml` installs `ffmpeg` and `mkvtoolnix` from apt, and the pipeline's ffmpeg and
+ffprobe 7.1.5 for the captions tests (the archive the image pins, its sha256 checked, off
+the PATH, named by `CAPTIONS_FFPROBE`), then runs:
 
 ```sh
 pip install -e ".[dev]"
@@ -48,6 +54,13 @@ pytest -q
 - `tests/test_chapters.py` reads files with chapter marks through the `ffprobe` on the PATH:
   those cases skip without ffmpeg and ffprobe, the mkvmerge cases (there and in the picture
   cases) without `mkvmerge`.
+- `tests/test_captions_real.py` reads clips the pipeline's ffmpeg 7.1 makes with its ffprobe
+  7.1: skipped without `CAPTIONS_FFPROBE`. The captions read bounds each ffprobe's address
+  space (RLIMIT_AS), which macOS can't lower: there its test checks the CPU bound alone.
+- `tests/test_captions_plan.py` holds the captions read to the caption-window plan vendored
+  as `tests/caption-windows.json` (pinned by its sha256), and `tests/test_captions_wire.py`
+  holds what the captions backfill sends to `tests/captions-reports.json`, a fixture a test
+  of the catalog's can take; `CAPTIONS_REPORTS_WRITE=1` writes it again.
 - The rest needs nothing installed. The catalog is a fake behind an httpx mock transport and
   the broker a fake (`tests/test_redelivery.py`, `tests/test_pictures.py`,
   `tests/test_chapter_backfill.py`).
@@ -73,7 +86,10 @@ python -m analyzer.main
 `KATALOG_API_URL` and the three `OIDC_` variables are required; `config.py` has the defaults
 of the others: `KAFKA_GROUP_ID`, `CONSUME_TOPIC`, `PRODUCE_TOPIC`, `KAFKA_SECURITY_PROTOCOL`
 (`PLAINTEXT`; a mounted `KAFKA_CERT_DIR` switches to mTLS). `PICTURE_AREA`,
-`PICTURE_BACKFILL`, `CHAPTER_BACKFILL` and `TIDB_ENABLED` set to `false` turn each off. Port
+`PICTURE_BACKFILL`, `CHAPTER_BACKFILL`, `CAPTIONS_BACKFILL` and `TIDB_ENABLED` set to
+`false` turn each off; `CAPTIONS_FFPROBE` names the captions ffprobe and
+`CAPTIONS_READ_TIMEOUT_S` bounds a captions read as a whole (1800 s; each ffprobe run of it 180 s,
+fixed). Port
 8080 serves `/healthz`, `/readyz` (whether the consumer thread is alive) and
 `/api/package/{item_id}`. Without a broker or a catalog it starts all the same, answers both
 probes and logs each failed connection. No mock server or recorded answers ship; the tests'
