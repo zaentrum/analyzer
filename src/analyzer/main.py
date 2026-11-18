@@ -5,6 +5,9 @@
     its pace
   - the chapter backfill (thread): the chapters of the titles that miss
     theirs, which the catalog hands out at its pace
+  - the captions backfill (thread): whether the originals the catalog
+    hands out at its pace carry closed captions, read with the pipeline's
+    ffprobe 7.1 (CAPTIONS_FFPROBE), never the image's own
   - a per-item packaging consumer (thread, fed by the FastAPI endpoint)
   - a tiny FastAPI server for /healthz and /readyz, so k8s probes work.
 The event consumer is the actual job; the HTTP server is just kubelet
@@ -24,7 +27,7 @@ import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
-from . import chapter_backfill, pictures
+from . import captions_backfill, chapter_backfill, pictures
 from .config import Config
 from .katalog import KatalogClient
 from .packager import package_item, package_status
@@ -117,6 +120,30 @@ def main() -> int:
             name="analyzer-chapters",
         )
         chapter_thread.start()
+
+    # The captions backfill: whether each original the catalog hands out
+    # carries closed captions, 48 video packets decoded in each of its
+    # windows (the start, 10 to 90 %) with the pipeline's ffprobe 7.1
+    # (CAPTIONS_FFPROBE; it refuses to start with any other, the image's
+    # 4.4.2 on the PATH included), at the catalog's pace
+    # (CAPTIONS_BACKFILL=false: none asked here). Its own client, as the
+    # others'.
+    captions_thread: threading.Thread | None = None
+    if captions_backfill.enabled():
+        captions_client = KatalogClient(
+            base_url=cfg.katalog_api_url,
+            token_url=cfg.oidc_token_url,
+            client_id=cfg.oidc_client_id,
+            client_secret=cfg.oidc_client_secret,
+        )
+        captions_thread = threading.Thread(
+            target=captions_backfill.CaptionsBackfill(
+                captions_client, stop, socket.gethostname()
+            ).run,
+            daemon=True,
+            name="analyzer-captions",
+        )
+        captions_thread.start()
 
     # Single event-consumer thread. It CONSUMEs the enriched-item topic,
     # runs the per-file pipeline, and PRODUCEs the analyzed-item topic.
@@ -228,6 +255,9 @@ def main() -> int:
     if chapter_thread is not None:
         # A read in hand is stopped, and its title given back.
         chapter_thread.join(timeout=15)
+    if captions_thread is not None:
+        # A read in hand is stopped, and its original given back.
+        captions_thread.join(timeout=15)
     return 0
 
 

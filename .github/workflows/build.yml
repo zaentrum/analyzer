@@ -33,5 +33,21 @@ jobs:
       # mkvmerge writes one (the measurement decodes with PyAV's own
       # libraries)
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix
+      # the captions tests read with the pipeline's ffprobe 7.1.5, the
+      # archive the image pins (its sha256 checked), and make their clips
+      # with its ffmpeg; neither goes on the PATH, whose ffprobe the
+      # captions backfill refuses
+      - name: ffmpeg 7.1.5 for the captions tests
+        env:
+          URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz
+          SHA256: c1e6caf48923dd8e6bc5e54d51ba70c321175b8162ae9c414c392990e72f0e79
+        run: |
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/ffmpeg-7.1.tar.xz"
+          echo "$SHA256  $RUNNER_TEMP/ffmpeg-7.1.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg-7.1"
+          tar -xJf "$RUNNER_TEMP/ffmpeg-7.1.tar.xz" -C "$RUNNER_TEMP/ffmpeg-7.1" --strip-components=1 \
+            --wildcards '*/bin/ffprobe' '*/bin/ffmpeg'
+          "$RUNNER_TEMP/ffmpeg-7.1/bin/ffprobe" -version | head -n 1
+          echo "CAPTIONS_FFPROBE=$RUNNER_TEMP/ffmpeg-7.1/bin/ffprobe" >> "$GITHUB_ENV"
       - run: pip install -e ".[dev]"
       - run: pytest -q
